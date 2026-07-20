@@ -1,3 +1,12 @@
+<p align="center">
+  <img src="assets/elixir_agent_debug.svg" width="200" height="200" alt="elixir_agent_debug logo" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/nshkrdotcom/elixir_agent_debug"><img src="https://img.shields.io/badge/GitHub-nshkrdotcom%2Felixir__agent__debug-181717?style=flat&logo=github" alt="GitHub Repo" /></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat" alt="License: MIT" /></a>
+</p>
+
 # elixir_agent_debug
 
 A deliberately small, user-level debugging layer for **Claude Code CLI** and
