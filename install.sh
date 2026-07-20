@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-for command in python3 cp mkdir rm readlink mktemp mv ln; do
+for command in python3 cp mkdir rm readlink mktemp mv ln chmod; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'install.sh: required command not found: %s\n' "$command" >&2
     exit 127
@@ -88,6 +88,10 @@ install_command() {
 }
 
 install_package
+chmod 0755 -- "$TARGET/bin/beam-debug"
+chmod 0755 -- "$TARGET/hooks/stop_guard.py"
+chmod 0755 -- "$TARGET/lib/manage_install.py"
+chmod 0755 -- "$TARGET/uninstall.sh"
 MANAGER="$TARGET/lib/manage_install.py"
 install_command
 
