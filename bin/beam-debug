@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
+GUARD="$ROOT/hooks/stop_guard.py"
+HELPER="$ROOT/support/beam_debug.exs"
+
+usage() {
+  cat <<'USAGE'
+Usage: beam-debug <command> [args]
+
+Commands:
+  doctor                    Check the local install and BEAM toolchain
+  test [mix-test-args...]    Run `mix test --trace ...` inline
+  itest [mix-test-args...]   Run interactive `iex -S mix test --trace ...`
+                            with BeamDebug helpers preloaded
+  iex [mix-args...]          Run `iex -S mix ...` with helpers preloaded
+  capture -- <command...>    Run inline and tee output to a per-repo latest.log
+  latest                    Print the latest captured log for this repo
+  scan                      List newly-added `# BEAMDBG` markers
+  assert-clean              Exit nonzero when newly-added markers remain
+  help                      Show this help
+USAGE
+}
+
+repo_identity() {
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  printf '%s' "$root" | sha256sum | cut -c1-16
+}
+
+log_path() {
+  local base key
+  base="${XDG_STATE_HOME:-$HOME/.local/state}/beam-debug"
+  key="$(repo_identity)"
+  printf '%s/%s/latest.log\n' "$base" "$key"
+}
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'beam-debug: required command not found: %s\n' "$1" >&2
+    exit 127
+  fi
+}
+
+doctor() {
+  local failed=0
+  printf 'elixir-agent-debug root: %s\n' "$ROOT"
+
+  for command in bash python3 git sha256sum; do
+    if command -v "$command" >/dev/null 2>&1; then
+      printf 'ok: %-10s %s\n' "$command" "$(command -v "$command")"
+    else
+      printf 'missing: %s\n' "$command"
+      failed=1
+    fi
+  done
+
+  for command in elixir mix iex; do
+    if command -v "$command" >/dev/null 2>&1; then
+      printf 'ok: %-10s %s\n' "$command" "$(command -v "$command")"
+    else
+      printf 'missing for BEAM use: %s\n' "$command"
+      failed=1
+    fi
+  done
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'ok: git repo   %s\n' "$(git rev-parse --show-toplevel)"
+  else
+    printf 'note: current directory is not inside a git worktree; marker scanning is inactive here.\n'
+  fi
+
+  printf 'claude skill: %s\n' "$HOME/.claude/skills/elixir-debug/SKILL.md"
+  printf 'codex skill:  %s\n' "$HOME/.agents/skills/elixir-debug/SKILL.md"
+  printf 'capture log:  %s\n' "$(log_path)"
+
+  return "$failed"
+}
+
+capture() {
+  need tee
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  if [[ $# -eq 0 ]]; then
+    printf 'beam-debug capture: missing command\n' >&2
+    exit 2
+  fi
+
+  local output status
+  output="$(log_path)"
+  mkdir -p -- "$(dirname -- "$output")"
+  printf '$' | tee "$output"
+  printf ' %q' "$@" | tee -a "$output"
+  printf '\n' | tee -a "$output"
+
+  set +e
+  "$@" 2>&1 | tee -a "$output"
+  status=${PIPESTATUS[0]}
+  set -e
+  printf '\n[exit %d] log: %s\n' "$status" "$output" | tee -a "$output"
+  return "$status"
+}
+
+command="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  doctor)
+    doctor
+    ;;
+  test)
+    need mix
+    exec mix test --trace "$@"
+    ;;
+  itest)
+    need iex
+    need mix
+    exec iex -r "$HELPER" -S mix test --trace "$@"
+    ;;
+  iex)
+    need iex
+    need mix
+    exec iex -r "$HELPER" -S mix "$@"
+    ;;
+  capture)
+    capture "$@"
+    ;;
+  latest)
+    file="$(log_path)"
+    if [[ ! -f "$file" ]]; then
+      printf 'beam-debug: no captured log for this repository: %s\n' "$file" >&2
+      exit 1
+    fi
+    cat -- "$file"
+    ;;
+  scan)
+    need python3
+    exec python3 "$GUARD" --scan
+    ;;
+  assert-clean)
+    need python3
+    exec python3 "$GUARD" --assert-clean
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    printf 'beam-debug: unknown command: %s\n\n' "$command" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
