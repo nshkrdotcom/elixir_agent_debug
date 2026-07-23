@@ -12,10 +12,13 @@ PROBE_SNAPSHOT="$ROOT/support/probe_snapshot.exs"
 PACKAGE_VERSION="$(cat -- "$ROOT/VERSION" 2>/dev/null || printf '0.0.0')"
 
 # Trusted absolute binary paths, recorded by install.sh while PATH was the
-# installing user's own. A project environment can prepend PATH (direnv,
-# venv, a repo bin/) and substitute python3 or git; resolving through this
-# file instead closes that. Running uninstalled from a checkout (no conf)
-# falls back to PATH — a development convenience, not the hardened mode.
+# installing user's own; python3 and git resolve through this file first.
+# This is best-effort hardening for the CLI, not an isolation boundary: the
+# CLI still resolves ordinary shell utilities (sed, sort, tee, ...) through
+# PATH and exists to run the project's own toolchain (mix, elixir), which is
+# project-controlled code by definition. The strict no-project-injection
+# guarantee is scoped to the automatic Stop hook, whose chain never touches
+# PATH. Running uninstalled from a checkout (no conf) falls back to PATH.
 RUNTIME_CONF="$ROOT/lib/runtime-paths.conf"
 PYTHON3_BIN=""
 GIT_BIN=""

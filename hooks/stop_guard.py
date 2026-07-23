@@ -16,8 +16,10 @@ Modes:
   no args         Stop-hook mode for Claude Code and Codex CLI
 
 Token-specific checks (--end and the Stop hook) search the full current
-contents of tracked and untracked sources, not just diffs: instrumentation
-that was accidentally committed leaves a clean diff but is still present.
+contents of tracked files, the staged index, and untracked sources, not
+just diffs: instrumentation that was accidentally committed leaves a clean
+diff but is still present, and a marker staged then reverted out of the
+worktree is invisible to a worktree search yet would still be committed.
 The session-unique token keeps that search unambiguous. The whole-worktree
 --scan/--assert-clean audit stays newly-added-lines-only, because a generic
 marker in committed content is not necessarily anyone's leftover.
@@ -216,16 +218,25 @@ def untracked_findings(root, needle):
     return findings
 
 
-def tracked_findings(root, needle):
-    # type: (Path, str) -> List[Finding]
+def tracked_findings(root, needle, cached=False):
+    # type: (Path, str, bool) -> List[Finding]
     # Full current contents of tracked files, not just diffs: instrumentation
     # that was accidentally committed leaves a clean diff but is still there.
-    # Safe for token searches only — the token is session-unique, so matching
-    # committed content cannot pick up another session's work.
-    result = git(root, "grep", "-nIF", "-z", needle, "--", *SOURCE_GLOBS)
+    # The index pass (--cached) matters independently: a marker staged with
+    # `git add` and then restored out of the working tree is invisible to a
+    # worktree grep but would still be committed. Safe for token searches
+    # only — the token is session-unique, so matching committed or staged
+    # content cannot pick up another session's work.
+    args = ["grep", "-nIF", "-z"]
+    if cached:
+        args.append("--cached")
+    args.extend([needle, "--"])
+    args.extend(SOURCE_GLOBS)
+    result = git(root, *args)
     if result.returncode not in (0, 1):
         raise RuntimeError(result.stderr.strip() or "git grep failed")
 
+    source = "index" if cached else "tracked"
     findings = []  # type: List[Finding]
     for raw in result.stdout.splitlines():
         parts = raw.split("\0", 2)
@@ -236,7 +247,7 @@ def tracked_findings(root, needle):
             line = int(number)
         except ValueError:
             continue
-        findings.append(Finding(path, line, content.strip(), "tracked"))
+        findings.append(Finding(path, line, content.strip(), source))
     return findings
 
 
@@ -264,6 +275,7 @@ def collect_token(cwd, token):
 
     needle = marker_for(token)
     combined = tracked_findings(root, needle)
+    combined.extend(tracked_findings(root, needle, cached=True))
     combined.extend(untracked_findings(root, needle))
 
     deduped = {}  # type: Dict[Tuple[str, int, str], Finding]
@@ -364,22 +376,29 @@ def begin(cwd, explicit_session):
         return 1
 
     session_id = explicit_session or env_session_id()
-    if session_id:
-        for _path, entry in load_entries(root):
-            if entry.get("session_id") == session_id:
-                print_begin_instructions(str(entry["token"]), session_id, reused=True)
-                return 0
-
-    token = secrets.token_hex(4)
     directory = sessions_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
     # Ledgers and everything else under the state directory can reference
-    # private work; keep state directories 0700 and state files 0600.
+    # private work; keep state directories 0700 and state files 0600. Runs
+    # before the reuse check so pre-1.4.4 ledgers created under a permissive
+    # umask are tightened too, not only freshly created ones.
     for level in (directory, directory.parent, directory.parent.parent):
         try:
             os.chmod(str(level), 0o700)
         except OSError:
             pass
+
+    if session_id:
+        for path, entry in load_entries(root):
+            if entry.get("session_id") == session_id:
+                try:
+                    os.chmod(str(path), 0o600)
+                except OSError:
+                    pass
+                print_begin_instructions(str(entry["token"]), session_id, reused=True)
+                return 0
+
+    token = secrets.token_hex(4)
     entry = {
         "token": token,
         "session_id": session_id,

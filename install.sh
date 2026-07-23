@@ -110,9 +110,11 @@ chmod 0755 -- "$TARGET/uninstall.sh"
 MANAGER="$TARGET/lib/manage_install.py"
 
 # Record trusted absolute binary paths now, while PATH is the installing
-# user's own. Everything package-owned resolves python3 and git through this
-# file afterwards, so a project-prepended PATH (direnv, venv, a repo bin/)
-# cannot substitute either binary under the Stop hook or the CLI.
+# user's own. The Stop hook chain resolves exclusively through these — the
+# hook command embeds the absolute interpreter and the script reads git from
+# this file — so a project-prepended PATH (direnv, venv, a repo bin/) cannot
+# substitute either binary under the hook. The interactive CLI prefers the
+# same paths but is not an isolation boundary; see the README.
 PYTHON3_BIN="$(readlink -f -- "$(command -v python3)")"
 if command -v git >/dev/null 2>&1; then
   GIT_BIN="$(readlink -f -- "$(command -v git)")"

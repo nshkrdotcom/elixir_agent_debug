@@ -171,6 +171,37 @@ hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false
   | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook still active after end: $hook_out"
 
+# A marker staged in the index while the worktree is clean must still be
+# caught: a worktree grep sees neither the diff nor the staged content, but
+# the staged marker is exactly what the next commit would contain.
+token_idx="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-idx | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
+[[ -n "$token_idx" ]] || fail 'begin (staged-index test) did not print a token'
+cat > "$repo/sample.ex" <<ELIXIR
+defmodule Sample do
+  def value do
+    IO.inspect(:ok, label: "BEAMDBG value") # BEAMDBG:$token_idx
+  end
+end
+ELIXIR
+git -C "$repo" add sample.ex
+git -C "$repo" restore --source=HEAD --worktree sample.ex
+if (cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$token_idx" >/dev/null 2>&1); then
+  fail 'end missed a staged-only marker (dirty index, clean worktree)'
+fi
+hook_json="$(printf '{"cwd":"%s","session_id":"sess-idx","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
+python3 - "$hook_json" "$token_idx" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["decision"] == "block", value
+assert "BEAMDBG:" + sys.argv[2] in value["reason"], value
+PY
+git -C "$repo" restore --staged sample.ex
+(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$token_idx" >/dev/null) \
+  || fail 'end failed after the staged marker was removed'
+
 printf 'Checking untracked-file scan hardening (symlinks, non-regular files)...\n'
 mkfifo "$repo/direct.ex"
 mkfifo "$repo/fifo_target"
@@ -195,6 +226,18 @@ ledger_file="$(find "$sessions_dir" -name "$ledger_token.json" | head -1)"
 [[ -n "$ledger_file" ]] || fail 'ledger file not found'
 [[ "$(stat -c %a "$ledger_file")" == "600" ]] \
   || fail "ledger file is not 0600: $(stat -c %a "$ledger_file")"
+
+# A pre-1.4.4 ledger created under a permissive umask must be tightened when
+# the session is reused, not only when a new ledger is created.
+chmod 0644 -- "$ledger_file"
+chmod 0755 -- "$sessions_dir"
+(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-perms >/dev/null) || fail 'begin (reuse) failed'
+[[ "$(stat -c %a "$ledger_file")" == "600" ]] \
+  || fail "reused ledger was not tightened to 0600: $(stat -c %a "$ledger_file")"
+[[ "$(stat -c %a "$sessions_dir")" == "700" ]] \
+  || fail "sessions directory was not re-tightened to 0700: $(stat -c %a "$sessions_dir")"
+
 (cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$ledger_token" >/dev/null) \
   || fail 'could not retire the permissions-test ledger'
 

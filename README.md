@@ -378,8 +378,9 @@ mix test test/my_test.exs:123
 beam-debug end ab12cd34
 ```
 
-`end` searches the full current contents of tracked and untracked sources
-for the token — instrumentation that slipped into a commit is still caught —
+`end` searches the full current contents of tracked files, the staged index,
+and untracked sources for the token — instrumentation that slipped into a
+commit, or was staged and no longer shows in the worktree, is still caught —
 and retires the session once clean. The optional Stop hook performs the same
 owned check automatically when the agent session stops.
 
@@ -500,9 +501,11 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
   is provided to shell commands; the Stop event carries the matching
   `session_id`);
 - checks only lines carrying that session's own `BEAMDBG:<token>` marker —
-  in the full current contents of tracked and untracked sources, so a marker
-  that was accidentally committed (clean diff, still present) is caught; the
-  session-unique token is what makes the deeper search unambiguous;
+  in the full current contents of tracked files, the staged index, and
+  untracked sources, so a marker that was accidentally committed (clean
+  diff, still present) or staged and then reverted out of the worktree
+  (clean worktree, would still be committed) is caught; the session-unique
+  token is what makes the deeper search unambiguous;
 - blocks at most once, listing exact locations, and instructs the agent to
   remove **only those lines** — other markers are explicitly out of scope;
 - allows the next stop even if markers remain, surfacing a warning, so a bad
@@ -513,13 +516,19 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
 - never edits source files itself;
 - runs isolated Python by absolute path: the hook command pins the
   interpreter path recorded at install time and passes `-I -S`, and the
-  scripts resolve `git` through the same install-time record
-  (`lib/runtime-paths.conf`) — so a project environment can neither
-  substitute the binaries via a prepended `PATH` (direnv, venv, a repo
-  `bin/`) nor inject code via `PYTHONPATH`/`sitecustomize`, and cannot
-  corrupt the scripts' output protocols. Upgrading with `--hooks` migrates
-  every earlier hook-command form (plain `python3`, PATH-resolved
-  `python3 -I -S`, older absolute paths) to one current entry;
+  script resolves `git` through the same install-time record
+  (`lib/runtime-paths.conf`) — nothing in the hook chain touches `PATH`, so
+  a project environment can neither substitute the binaries via a prepended
+  `PATH` (direnv, venv, a repo `bin/`) nor inject code via
+  `PYTHONPATH`/`sitecustomize`, and cannot corrupt the scripts' output
+  protocols. Upgrading with `--hooks` migrates every earlier hook-command
+  form (plain `python3`, PATH-resolved `python3 -I -S`, older absolute
+  paths) to one current entry. This no-injection guarantee is scoped to the
+  automatic hook: the interactive `beam-debug` CLI prefers the same
+  recorded binaries but still resolves ordinary shell utilities through
+  `PATH`, and it exists to run the project's own toolchain (`mix`,
+  `elixir`) — project-controlled code by definition — so treat running it
+  inside a repository with the same trust you give `mix test` there;
 - reads untracked files defensively: symlinks are never followed, only
   regular files are read (a FIFO or device node is skipped, not waited on),
   and reads are capped at 1 MiB — an untracked path in a repository is
