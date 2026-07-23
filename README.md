@@ -265,30 +265,41 @@ BeamDebug.trace_calls({MyServer, :handle_call, 3}, limit: 50)
 
 ### Inline instrumentation, as a fallback
 
-Still the fastest check for an already-localized data-flow error. Mark every
-temporary line with the literal `BEAMDBG` marker in the language's own
-comment syntax and remove it in the same turn:
+Still the fastest check for an already-localized data-flow error. The agent
+workflow is owned end to end, hook or no hook: `beam-debug begin` prints a
+session token, every temporary line carries it in the language's own comment
+syntax, and `beam-debug end <token>` verifies those exact lines are gone
+before the task completes:
+
+```bash
+beam-debug begin        # prints the token, e.g. ab12cd34
+```
 
 ```elixir
 result = expensive_step(input)
-IO.inspect(result, label: "BEAMDBG expensive_step") # BEAMDBG
+IO.inspect(result, label: "BEAMDBG expensive_step") # BEAMDBG:ab12cd34
 ```
 
 ```erlang
 Result = expensive_step(Input),
-io:format("BEAMDBG expensive_step ~p~n", [Result]), % BEAMDBG
+io:format("BEAMDBG expensive_step ~p~n", [Result]), % BEAMDBG:ab12cd34
 ```
 
 ```bash
 mix test test/my_test.exs:123
-beam-debug assert-clean
+beam-debug end ab12cd34
 ```
 
-When the optional Stop hook is installed, start a marker session first:
-`beam-debug begin` prints a token, temporary lines carry it
-(`# BEAMDBG:<token>`, `% BEAMDBG:<token>`), and `beam-debug end <token>`
-verifies they are gone. The hook then checks exactly those lines and nothing
-else. Without hooks the plain marker plus `assert-clean` is enough.
+`end` searches the full current contents of tracked and untracked sources
+for the token — instrumentation that slipped into a commit is still caught —
+and retires the session once clean. The optional Stop hook performs the same
+owned check automatically when the agent session stops.
+
+`beam-debug scan` and `beam-debug assert-clean` are the whole-worktree audit
+for **any** newly-added `BEAMDBG` marker, regardless of session. They are
+human-invoked tools, not part of the agent's ordinary completion path: in a
+shared worktree, another session's markers are not the current agent's to
+clean.
 
 `beam-debug capture -- ...` is optional. It tees output to a per-repository file
 under `${XDG_STATE_HOME:-~/.local/state}/beam-debug/` while preserving the
@@ -384,8 +395,10 @@ Two layers, with very different authority:
 **Manual, whole-worktree** — `beam-debug scan` and `beam-debug assert-clean`
 look at newly-added lines in staged/unstaged diffs and at untracked `.ex`,
 `.exs`, `.erl` and `.hrl` files. They never block because an old committed
-file happens to contain the string `BEAMDBG`. They are explicit commands: run
-them when *you* want the whole worktree checked.
+file happens to contain the string `BEAMDBG`. They are explicit commands for
+a repository-wide audit: run them when *you* want the whole worktree
+checked. The instructions steer agents to the owned `begin`/`end` cycle
+instead, so an agent is never asked to judge markers that are not its own.
 
 **Automatic, session-owned** — the optional Stop hook enforces ownership or
 nothing. A global "any `BEAMDBG` anywhere in this dirty worktree?" check is
@@ -398,7 +411,10 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
   binds a marker token to that agent session's id (`CLAUDE_CODE_SESSION_ID`
   is provided to shell commands; the Stop event carries the matching
   `session_id`);
-- checks only lines carrying that session's own `BEAMDBG:<token>` marker;
+- checks only lines carrying that session's own `BEAMDBG:<token>` marker —
+  in the full current contents of tracked and untracked sources, so a marker
+  that was accidentally committed (clean diff, still present) is caught; the
+  session-unique token is what makes the deeper search unambiguous;
 - blocks at most once, listing exact locations, and instructs the agent to
   remove **only those lines** — other markers are explicitly out of scope;
 - allows the next stop even if markers remain, surfacing a warning, so a bad
@@ -428,7 +444,8 @@ The smoke test checks shell/Python syntax, compilation of the BEAM helper and
 both probes when `elixirc` is available, marker detection in Elixir and
 Erlang sources (staged, unstaged and untracked), the session-owned Stop-hook
 semantics (fail-open without a ledger or session metadata, ownership block,
-other-session allow, one-shot continuation, `begin`/`end` round-trip), CLI
+other-session allow, one-shot continuation, `begin`/`end` round-trip,
+detection of accidentally *committed* owned markers), CLI
 argument validation, journal round-tripping, idempotent install, hook JSON
 merging and removal, and uninstall behavior in an isolated temporary home. It
 also asserts that `beam-debug test` never gains an implicit `--trace`.

@@ -313,6 +313,12 @@ defmodule BeamDebug do
   completion and explicit stops all act on that session only: a stale timer or
   a late cleanup from an earlier trace can never stop a newer one.
 
+  Designed for one caller at a time: the ownership claim is not atomic, so
+  starting traces concurrently from several processes in the same VM is
+  unsupported and can race. Sequential use — including from different
+  processes — is fine; `beam-debug trace` runs each trace in its own VM and
+  never hits this.
+
   Setup is transactional: `limit`, `for` and the target arity are validated
   first, and if installation fails partway the flags already set are removed,
   the tracer is terminated, and the session is erased before the error
@@ -393,7 +399,7 @@ defmodule BeamDebug do
 
     # Ownership goes in before the flags so a concurrent trace_calls sees the
     # claim; the rollback below removes it if installation fails.
-    :persistent_term.put(@session_key, %{id: id, tracer: tracer, pattern: pattern})
+    :persistent_term.put(@session_key, %{id: id, tracer: tracer, pattern: pattern, device: device})
 
     case safe(fn ->
            :erlang.trace(:all, true, [:call, :timestamp, {:tracer, tracer}])
@@ -499,7 +505,7 @@ defmodule BeamDebug do
   # stop a trace they did not start.
   defp stop_session(id, timeout \\ 2_000) do
     case current_session() do
-      %{id: ^id, pattern: pattern, tracer: tracer} ->
+      %{id: ^id, pattern: pattern, tracer: tracer} = session ->
         disable_tracing(pattern)
 
         if is_pid(tracer) and Process.alive?(tracer) do
@@ -520,7 +526,27 @@ defmodule BeamDebug do
             timeout -> :ok
           end
 
+          # Ownership is released below, so a still-running tracer must not
+          # outlive this call: it could otherwise keep printing stale events
+          # into a successor trace's output. Confirm the exit; kill on
+          # timeout (possible when the io device is wedged and the syncs
+          # above timed out with the stop message stuck behind the backlog).
+          monitor = Process.monitor(tracer)
           send(tracer, :beamdbg_stop)
+
+          receive do
+            {:DOWN, ^monitor, :process, ^tracer, _reason} -> :ok
+          after
+            timeout ->
+              Process.exit(tracer, :kill)
+              Process.demonitor(monitor, [:flush])
+
+              IO.puts(
+                Map.get(session, :device, :stderr),
+                "[BEAMDBG] tracer did not stop in time and was killed; " <>
+                  "trailing trace output may have been discarded"
+              )
+          end
         end
 
         release_session(id)

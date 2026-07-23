@@ -15,6 +15,13 @@ Modes:
                   ledger entry; exit 1 while any remain
   no args         Stop-hook mode for Claude Code and Codex CLI
 
+Token-specific checks (--end and the Stop hook) search the full current
+contents of tracked and untracked sources, not just diffs: instrumentation
+that was accidentally committed leaves a clean diff but is still present.
+The session-unique token keeps that search unambiguous. The whole-worktree
+--scan/--assert-clean audit stays newly-added-lines-only, because a generic
+marker in committed content is not necessarily anyone's leftover.
+
 Stop-hook mode enforces ownership, never a global scan. It acts only when a
 ledger entry created by `beam-debug begin` is bound to the calling session's
 session_id, and it checks only markers carrying that session's token.
@@ -157,6 +164,30 @@ def untracked_findings(root, needle):
     return findings
 
 
+def tracked_findings(root, needle):
+    # type: (Path, str) -> List[Finding]
+    # Full current contents of tracked files, not just diffs: instrumentation
+    # that was accidentally committed leaves a clean diff but is still there.
+    # Safe for token searches only — the token is session-unique, so matching
+    # committed content cannot pick up another session's work.
+    result = git(root, "grep", "-nIF", "-z", needle, "--", *SOURCE_GLOBS)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.strip() or "git grep failed")
+
+    findings = []  # type: List[Finding]
+    for raw in result.stdout.splitlines():
+        parts = raw.split("\0", 2)
+        if len(parts) != 3:
+            continue
+        path, number, content = parts
+        try:
+            line = int(number)
+        except ValueError:
+            continue
+        findings.append(Finding(path, line, content.strip(), "tracked"))
+    return findings
+
+
 def collect(cwd, needle=MARKER):
     # type: (Path, str) -> Tuple[Optional[Path], List[Finding]]
     root = repo_root(cwd)
@@ -173,6 +204,22 @@ def collect(cwd, needle=MARKER):
     return root, sorted(deduped.values(), key=lambda x: (x.path, x.line, x.source))
 
 
+def collect_token(cwd, token):
+    # type: (Path, str) -> Tuple[Optional[Path], List[Finding]]
+    root = repo_root(cwd)
+    if root is None:
+        return None, []
+
+    needle = marker_for(token)
+    combined = tracked_findings(root, needle)
+    combined.extend(untracked_findings(root, needle))
+
+    deduped = {}  # type: Dict[Tuple[str, int, str], Finding]
+    for item in combined:
+        deduped[(item.path, item.line, item.text)] = item
+    return root, sorted(deduped.values(), key=lambda x: (x.path, x.line, x.source))
+
+
 def format_findings(root, findings):
     # type: (Path, List[Finding]) -> str
     lines = ["Temporary {} instrumentation remains under {}:".format(MARKER, root)]
@@ -180,6 +227,17 @@ def format_findings(root, findings):
         lines.append("  {}:{}: {} [{}]".format(item.path, item.line, item.text, item.source))
     lines.append(
         "Remove the temporary instrumentation, rerun the focused check, then run `beam-debug assert-clean`."
+    )
+    return "\n".join(lines)
+
+
+def format_token_findings(root, findings, token):
+    # type: (Path, List[Finding], str) -> str
+    lines = ["Markers from session {} remain under {}:".format(token, root)]
+    for item in findings:
+        lines.append("  {}:{}: {} [{}]".format(item.path, item.line, item.text, item.source))
+    lines.append(
+        "Remove these lines (also from commits, if already committed), then rerun `beam-debug end {}`.".format(token)
     )
     return "\n".join(lines)
 
@@ -287,9 +345,9 @@ def end(cwd, token):
     if token:
         chosen = [(p, e) for p, e in entries if e["token"] == token]
         if not chosen:
-            _root, findings = collect(cwd, marker_for(token))
+            _root, findings = collect_token(cwd, token)
             if findings:
-                print(format_findings(root, findings), file=sys.stderr)
+                print(format_token_findings(root, findings, token), file=sys.stderr)
                 return 1
             print("No ledger entry and no markers for token {}; nothing to do.".format(token))
             return 0
@@ -309,9 +367,10 @@ def end(cwd, token):
 
     status = 0
     for path, entry in chosen:
-        _root, findings = collect(cwd, marker_for(str(entry["token"])))
+        entry_token = str(entry["token"])
+        _root, findings = collect_token(cwd, entry_token)
         if findings:
-            print(format_findings(root, findings), file=sys.stderr)
+            print(format_token_findings(root, findings, entry_token), file=sys.stderr)
             status = 1
         else:
             try:
@@ -386,7 +445,7 @@ def hook_mode():
         remaining = []  # type: List[Tuple[str, List[Finding]]]
         for path, entry in owned:
             token = str(entry["token"])
-            _root, findings = collect(cwd, marker_for(token))
+            _root, findings = collect_token(cwd, token)
             if findings:
                 remaining.append((token, findings))
             else:

@@ -53,10 +53,12 @@ Temporary inline markers (Elixir `# BEAMDBG`, Erlang `% BEAMDBG`):
                               token to embed in markers (# BEAMDBG:<token>).
                               An installed Stop hook checks only markers
                               owned by its own agent session.
-  end [token]                 Verify this session's markers are gone, then
-                              drop the ledger entry
-  scan                        List all newly-added BEAMDBG markers
+  end [token]                 Verify this session's markers are gone — in
+                              committed content too — then drop the ledger
+  scan                        Whole-worktree audit: list anyone's newly-added
+                              BEAMDBG markers
   assert-clean                Exit nonzero when newly-added markers remain
+                              (whole-worktree audit, human-invoked)
 
 Evidence journal (optional, per repository):
   note <text> [--status open|confirmed|killed] [--evidence TEXT]

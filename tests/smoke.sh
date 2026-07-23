@@ -132,11 +132,36 @@ assert "decision" not in value, value
 assert "systemMessage" in value, value
 PY
 
-# end refuses while owned markers remain, then succeeds after removal.
+# end refuses while owned markers remain, names the token workflow, then
+# succeeds after removal.
+end_out="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" 2>&1)" \
+  && fail 'end succeeded while owned markers remained'
+printf '%s' "$end_out" | grep -q "beam-debug end $token" \
+  || fail "end did not point back at itself: $end_out"
+
+# An accidentally *committed* owned marker leaves a clean diff but must still
+# be caught by the token-specific checks (hook and end).
+git -C "$repo" add sample.ex
+git -C "$repo" commit -qm 'accidentally committed instrumentation'
+hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+python3 - "$hook_json" "$token" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["decision"] == "block", value
+assert "sample.ex:3" in value["reason"], value
+assert "BEAMDBG:" + sys.argv[2] in value["reason"], value
+PY
 if (cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null 2>&1); then
-  fail 'end succeeded while owned markers remained'
+  fail 'end missed a committed owned marker'
 fi
-git -C "$repo" checkout -q -- sample.ex
+# The whole-worktree audit stays newly-added-lines-only: the committed marker
+# must not fail it.
+(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean) \
+  || fail 'assert-clean flagged committed content'
+
+git -C "$repo" revert --no-edit HEAD >/dev/null
 (cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null) \
   || fail 'end failed after markers were removed'
 

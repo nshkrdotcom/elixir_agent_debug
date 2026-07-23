@@ -179,28 +179,33 @@ check for an already-localized data-flow error — when you know the function, t
 values are in one pipeline, and constructing a correct trace would take longer
 than reading the output. Use it there without apology.
 
-Every temporary source line must contain the literal `BEAMDBG` marker in the
-language's own comment syntax — `# BEAMDBG` in Elixir, `% BEAMDBG` in Erlang:
+Before adding any temporary line, run `beam-debug begin`. It prints a session
+token; every temporary line then carries that token in the language's own
+comment syntax — `# BEAMDBG:<token>` in Elixir, `% BEAMDBG:<token>` in Erlang:
 
 ```elixir
 input
 |> normalize()
-|> dbg() # BEAMDBG
+|> dbg() # BEAMDBG:ab12cd34
 |> persist()
 ```
 
 ```erlang
 Value = normalize(Input),
-io:format("BEAMDBG normalize -> ~p~n", [Value]), % BEAMDBG
+io:format("BEAMDBG normalize -> ~p~n", [Value]), % BEAMDBG:ab12cd34
 ```
 
-Optionally, run `beam-debug begin` first: it prints a session token, marked
-lines then carry it (`# BEAMDBG:<token>`, `% BEAMDBG:<token>`), and
-`beam-debug end <token>` verifies your own markers are gone at the end. Use
-this form when a Stop cleanup hook is installed — the hook checks only your
-session's tokened markers and ignores everyone else's. Never remove BEAMDBG
-markers you did not add this session: in a shared worktree they may be
-another session's live instrumentation or committed fixtures.
+Finish with `beam-debug end <token>`: it searches the full contents of
+tracked and untracked sources for your token — catching markers accidentally
+committed along the way — and retires the session once they are gone. This
+owned begin/end cycle is the standard flow whether or not a Stop hook is
+installed; the hook, when present, checks the same thing once at stop.
+
+Never remove a BEAMDBG marker that does not carry your token: in a shared
+worktree it may be another session's live instrumentation or a committed
+fixture. `beam-debug scan` and `beam-debug assert-clean` audit the whole
+worktree for anyone's newly-added markers — run them when the user asks for
+a repository-wide audit, not as part of your ordinary completion path.
 
 Remove the marked lines as soon as they confirm or kill the hypothesis. Do not
 leave instrumentation "for later." Adding several probes in one run is fine —
@@ -247,7 +252,7 @@ processes — serialization only removes concurrency between ExUnit cases.
 ## Interactive escalation
 
 `beam-debug pry-test` runs `iex -S mix test --trace` with the helpers preloaded,
-for a `require IEx; IEx.pry() # BEAMDBG` breakpoint. `--trace` is deliberate
+for a `require IEx; IEx.pry() # BEAMDBG:<token>` breakpoint. `--trace` is deliberate
 there: it sets test timeouts to `:infinity`, which is what makes `pry` usable.
 
 This path needs a real terminal. It is not reliably drivable from a
@@ -293,13 +298,15 @@ profilers (`mix profile.eprof`, `mix profile.cprof`, `mix profile.fprof`) and
 ## Before completing
 
 ```bash
-beam-debug assert-clean
+beam-debug end <token>   # if you added inline markers this session
 git diff --check
 ```
 
-If you started a marker session with `beam-debug begin`, finish it:
-`beam-debug end <token>` verifies your own markers are gone and retires the
-ledger entry.
+`beam-debug end` verifies your own markers are gone — including from
+commits — and retires the session ledger. Do not run the whole-worktree
+`assert-clean` here: it reports every session's newly-added markers, and
+someone else's instrumentation is not yours to clean. It exists for
+explicit, user-requested audits.
 
 Then run the narrowest relevant regression test. If the failure was flaky, re-run
 with the recorded seed and `--repeat-until-failure`. Run broader tests only when
