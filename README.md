@@ -161,12 +161,18 @@ Version skew then resolves one way, deliberately:
   instead: it instructs agents not to proceed unless `beam-debug doctor`
   prints both a `version:` line and an `ok: project floor ...` result —
   output a pre-1.4.0 `doctor` cannot produce;
-- `beam-debug` not installed at all → the checked-in block tells the reader
-  how to install it;
+- `beam-debug` not installed at all → the checked-in block gives the
+  *human* the install commands (cloning under `~/.local/src/`, outside the
+  project) and explicitly tells agents to stop and ask — repository
+  instructions must never direct an agent to modify user-level
+  configuration on its own;
 - want the check gone temporarily → set `enabled = false` in the manifest,
-  or delete the file. Anything else fails closed: a requirement manifest
-  with a malformed `enabled` or `minimum_version` is an error, not a silent
-  no-op.
+  or delete the file. Anything else fails closed: the manifest is validated
+  by a strict TOML parse (Python's `tomllib`), so invalid TOML, duplicate
+  keys, a quoted `"true"` where a boolean belongs, unknown keys, missing
+  required keys and non-version values are all errors — never a silently
+  disabled check. Validation needs Python 3.11+; an older interpreter also
+  fails closed, saying so.
 
 Raise `minimum_version` by editing the manifest and committing, like any
 other project requirement.

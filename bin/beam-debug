@@ -119,42 +119,19 @@ project_manifest() {
   printf '%s/.beam-debug.toml\n' "$root"
 }
 
-# manifest_value <file> <key> — tolerant `key = "value"` reader
-manifest_value() {
-  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*[\"']\{0,1\}\([^\"'#]*\)[\"']\{0,1\}.*/\1/p" "$1" \
-    | head -1 | tr -d '[:space:]'
-}
-
 # floor_satisfied <minimum> — true when PACKAGE_VERSION >= minimum
 floor_satisfied() {
   [[ "$(printf '%s\n%s\n' "$1" "$PACKAGE_VERSION" | sort -V | head -1)" == "$1" ]]
 }
 
 # manifest_floor <file> — prints the required minimum version; prints nothing
-# when the check is disabled. A requirement manifest fails closed: anything
-# other than enabled = true|false, or a non-version minimum, is an error.
+# when the check is disabled. Validation is a strict TOML parse in Python
+# (lib/project_manifest.py), not a shell extraction: a requirement manifest
+# fails closed on invalid TOML, duplicate or unknown keys, quoted booleans,
+# and missing or non-version values.
 manifest_floor() {
-  local file="$1" enabled minimum
-  enabled="$(manifest_value "$file" enabled)"
-  case "$enabled" in
-    false)
-      return 0
-      ;;
-    true)
-      ;;
-    *)
-      printf 'beam-debug: malformed %s: `enabled` must be true or false (got: %s)\n' \
-        "$file" "${enabled:-<missing>}" >&2
-      return 3
-      ;;
-  esac
-  minimum="$(manifest_value "$file" minimum_version)"
-  if ! [[ "$minimum" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-    printf 'beam-debug: malformed %s: `minimum_version` must be a plain version like "1.4.0" (got: %s)\n' \
-      "$file" "${minimum:-<missing>}" >&2
-    return 3
-  fi
-  printf '%s\n' "$minimum"
+  need python3
+  python3 "$ROOT/lib/project_manifest.py" "$1"
 }
 
 require_project_floor() {
@@ -238,25 +215,22 @@ doctor() {
     printf 'note: current directory is not inside a git worktree; marker scanning is inactive here.\n'
   fi
 
-  local manifest minimum enabled
+  local manifest floor_out floor_status
   if manifest="$(project_manifest)"; then
-    enabled="$(manifest_value "$manifest" enabled)"
-    minimum="$(manifest_value "$manifest" minimum_version)"
-    if [[ "$enabled" == "false" ]]; then
+    set +e
+    floor_out="$(manifest_floor "$manifest" 2>&1)"
+    floor_status=$?
+    set -e
+    if [[ "$floor_status" -ne 0 ]]; then
+      printf 'FAIL: %s\n' "$floor_out"
+      failed=1
+    elif [[ -z "$floor_out" ]]; then
       printf 'note: project manifest present but disabled: %s\n' "$manifest"
-    elif [[ "$enabled" != "true" ]]; then
-      printf 'FAIL: malformed %s: `enabled` must be true or false (got: %s)\n' \
-        "$manifest" "${enabled:-<missing>}"
-      failed=1
-    elif ! [[ "$minimum" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-      printf 'FAIL: malformed %s: `minimum_version` must be a plain version like "1.4.0" (got: %s)\n' \
-        "$manifest" "${minimum:-<missing>}"
-      failed=1
-    elif floor_satisfied "$minimum"; then
-      printf 'ok: project floor %s (installed %s)\n' "$minimum" "$PACKAGE_VERSION"
+    elif floor_satisfied "$floor_out"; then
+      printf 'ok: project floor %s (installed %s)\n' "$floor_out" "$PACKAGE_VERSION"
     else
       printf 'FAIL: this project requires >= %s but %s is installed; pull the latest and rerun ./install.sh\n' \
-        "$minimum" "$PACKAGE_VERSION"
+        "$floor_out" "$PACKAGE_VERSION"
       failed=1
     fi
   else

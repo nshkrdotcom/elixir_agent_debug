@@ -11,7 +11,8 @@ fail() {
 printf 'Checking syntax...\n'
 bash -n "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/bin/beam-debug" \
   "$ROOT/tests/smoke.sh" "$ROOT/tests/integration.sh"
-python3 -m py_compile "$ROOT/hooks/stop_guard.py" "$ROOT/lib/manage_install.py" "$ROOT/lib/journal.py"
+python3 -m py_compile "$ROOT/hooks/stop_guard.py" "$ROOT/lib/manage_install.py" \
+  "$ROOT/lib/journal.py" "$ROOT/lib/project_manifest.py"
 
 printf 'Checking that test runs are not silently serialized...\n'
 grep -q 'exec mix test "\$@"' "$ROOT/bin/beam-debug" \
@@ -331,59 +332,80 @@ set -e
 ) || fail 'captured log was not retrievable'
 
 printf 'Checking per-project manifest and version floor...\n'
-(
-  cd "$repo"
-  "$HOME/.local/bin/beam-debug" init-project >/dev/null
-  "$HOME/.local/bin/beam-debug" init-project >/dev/null
-) || fail 'init-project failed'
-[[ -f "$repo/.beam-debug.toml" ]] || fail 'init-project did not write the manifest'
-grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" \
-  || fail 'manifest minimum_version does not match the installed version'
-[[ "$(grep -c 'elixir-agent-debug:begin' "$repo/CLAUDE.md")" -eq 1 ]] \
-  || fail 'project CLAUDE.md block missing or duplicated'
-[[ "$(grep -c 'elixir-agent-debug:begin' "$repo/AGENTS.md")" -eq 1 ]] \
-  || fail 'project AGENTS.md block missing or duplicated'
+if python3 -c 'import tomllib' >/dev/null 2>&1; then
+  (
+    cd "$repo"
+    "$HOME/.local/bin/beam-debug" init-project >/dev/null
+    "$HOME/.local/bin/beam-debug" init-project >/dev/null
+  ) || fail 'init-project failed'
+  [[ -f "$repo/.beam-debug.toml" ]] || fail 'init-project did not write the manifest'
+  grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" \
+    || fail 'manifest minimum_version does not match the installed version'
+  [[ "$(grep -c 'elixir-agent-debug:begin' "$repo/CLAUDE.md")" -eq 1 ]] \
+    || fail 'project CLAUDE.md block missing or duplicated'
+  [[ "$(grep -c 'elixir-agent-debug:begin' "$repo/AGENTS.md")" -eq 1 ]] \
+    || fail 'project AGENTS.md block missing or duplicated'
+  grep -q 'never install or upgrade user-level tooling' "$repo/CLAUDE.md" \
+    || fail 'project note must forbid agent-run installation'
 
-printf 'enabled = true\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
-set +e
-(cd "$repo" && "$HOME/.local/bin/beam-debug" history) >/dev/null 2>&1
-floor_status=$?
-set -e
-[[ "$floor_status" -eq 3 ]] || fail "an unmet version floor should exit 3 (got $floor_status)"
-(cd "$repo" && "$HOME/.local/bin/beam-debug" help >/dev/null) \
-  || fail 'help must stay reachable under an unmet floor'
-if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
-  fail 'doctor should exit nonzero under an unmet floor'
+  printf 'enabled = true\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
+  set +e
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" history) >/dev/null 2>&1
+  floor_status=$?
+  set -e
+  [[ "$floor_status" -eq 3 ]] || fail "an unmet version floor should exit 3 (got $floor_status)"
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" help >/dev/null) \
+    || fail 'help must stay reachable under an unmet floor'
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
+    fail 'doctor should exit nonzero under an unmet floor'
+  fi
+  # Recovery commands must never be locked out by the floor.
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
+    || fail 'scan must stay reachable under an unmet floor'
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" assert-clean >/dev/null) \
+    || fail 'assert-clean must stay reachable under an unmet floor'
+  (cd "$repo" && XDG_STATE_HOME="$state" "$HOME/.local/bin/beam-debug" end >/dev/null) \
+    || fail 'end must stay reachable under an unmet floor'
+  # init-project must refuse to rewrite the notes of a project it is too old for.
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
+    fail 'init-project rewrote a project whose floor it does not meet'
+  fi
+  # A requirement manifest fails closed on strict-TOML grounds, not only on
+  # bad values: unterminated strings, duplicate keys, quoted booleans,
+  # missing required keys and unknown keys are all errors.
+  while IFS= read -r bad; do
+    printf '%b\n' "$bad" > "$repo/.beam-debug.toml"
+    if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
+      fail "a malformed manifest must be an error: $bad"
+    fi
+  done <<'BADCASES'
+enabled = maybe
+enabled = "true"
+enabled = "true
+enabled = true\nenabled = true
+enabled = true\nminimum_version = "banana"
+enabled = true\nminimum_version = "1.4.1
+enabled = true
+enabled = true\nminimum_version = "1.0.0"\nextra = 1
+BADCASES
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
+    fail 'doctor should exit nonzero on a malformed manifest'
+  fi
+  printf 'enabled = false\n' > "$repo/.beam-debug.toml"
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
+    || fail 'enabled = false must disable the floor check'
+  printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
+    || fail 'a satisfied floor must not block commands'
+else
+  printf 'note: python3 lacks tomllib (needs 3.11+); checking fail-closed behavior only.\n'
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null) \
+    || fail 'init-project failed'
+  printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
+    fail 'the floor must fail closed when tomllib is unavailable'
+  fi
 fi
-# Recovery commands must never be locked out by the floor.
-(cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
-  || fail 'scan must stay reachable under an unmet floor'
-(cd "$repo" && "$HOME/.local/bin/beam-debug" assert-clean >/dev/null) \
-  || fail 'assert-clean must stay reachable under an unmet floor'
-(cd "$repo" && XDG_STATE_HOME="$state" "$HOME/.local/bin/beam-debug" end >/dev/null) \
-  || fail 'end must stay reachable under an unmet floor'
-# init-project must refuse to rewrite the notes of a project it is too old for.
-if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
-  fail 'init-project rewrote a project whose floor it does not meet'
-fi
-# A requirement manifest fails closed, never silently off.
-printf 'enabled = maybe\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
-if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
-  fail 'a malformed enabled value must be an error'
-fi
-printf 'enabled = true\nminimum_version = "banana"\n' > "$repo/.beam-debug.toml"
-if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
-  fail 'a malformed minimum_version must be an error'
-fi
-if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
-  fail 'doctor should exit nonzero on a malformed manifest'
-fi
-printf 'enabled = false\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
-(cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
-  || fail 'enabled = false must disable the floor check'
-printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
-(cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
-  || fail 'a satisfied floor must not block commands'
 
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh"
 
