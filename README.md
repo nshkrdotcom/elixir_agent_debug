@@ -44,8 +44,9 @@ Common:
 - one small command: `beam-debug`
 - one helper module, loaded only when requested, for live process observation
 - two probe files that instrument a run **without editing the repository**
-- one deterministic scanner for temporary `# BEAMDBG` markers
-- one per-repository evidence journal
+- one deterministic scanner for temporary `BEAMDBG` markers (`# BEAMDBG` in
+  Elixir, `% BEAMDBG` in Erlang; `.ex`, `.exs`, `.erl` and `.hrl` sources)
+- one per-repository evidence journal and session marker ledger
 
 Claude-specific:
 
@@ -57,12 +58,13 @@ Codex-specific:
 - the same skill is copied to `~/.agents/skills/elixir-debug/`
 - a short managed block is added to `~/.codex/AGENTS.md`
 
-Optional:
+Optional, off by default:
 
-- `./install.sh --hooks` adds the same lightweight `Stop` cleanup guard to
+- `./install.sh --hooks` adds a session-owned `Stop` cleanup guard to
   `~/.claude/settings.json` and `~/.codex/hooks.json`
-- the guard asks the agent once to remove newly-added `# BEAMDBG` lines before
-  stopping; it deliberately does not create an infinite stop loop
+- the guard acts only on marker sessions that the stopping agent session
+  itself started with `beam-debug begin`, asks once, and fails open in every
+  other case — see [Cleanup guard semantics](#cleanup-guard-semantics)
 
 ## Install
 
@@ -71,7 +73,7 @@ From the packet:
 ```bash
 unzip elixir-agent-debug-v1.zip
 cd elixir-agent-debug-v1
-./install.sh --hooks
+./install.sh
 ```
 
 From a Git checkout:
@@ -79,23 +81,32 @@ From a Git checkout:
 ```bash
 git clone <this-repo-url> elixir-agent-debug
 cd elixir-agent-debug
-./install.sh --hooks
+./install.sh
 ```
 
-`--hooks` is the recommended install: it adds the one-shot cleanup guard. Omit
-it for an instruction-and-tools-only install that never edits either client's
-hook configuration.
+The default install is instructions and tools only; it never edits either
+client's hook configuration. Cleanup checking is explicit: the agent (or you)
+runs `beam-debug assert-clean`.
+
+`--hooks` opts in to the automatic Stop-hook check. It is deliberately not
+the default: a Stop hook runs at the end of *every* session in every
+repository, so it must be — and now is — inert unless the stopping session
+itself started a marker session. `--remove-hooks` removes a previously
+installed hook from both clients.
 
 Install for only one client:
 
 ```bash
-./install.sh --claude-only --hooks
-./install.sh --codex-only --hooks
+./install.sh --claude-only
+./install.sh --codex-only
 ```
 
 The installer is idempotent and only owns files or marked sections created by
-this package. It refuses to overwrite an unrelated skill or executable with the
-same name.
+this package. It refuses to overwrite an unrelated skill or executable with
+the same name. Selection is **additive**: installing for one client does not
+remove the other client's integration, and reinstalling without `--hooks`
+does not remove an existing hook — removal is always explicit, via
+`--remove-hooks` or `./uninstall.sh`.
 
 After installation, start a **new CLI session**. Claude can also notice skill
 changes live when its personal skills directory already existed, but a new
@@ -130,9 +141,19 @@ beam-debug report
 beam-debug iex
 beam-debug capture -- mix test test/path_test.exs:42
 beam-debug latest
+beam-debug begin
+beam-debug end
 beam-debug scan
 beam-debug assert-clean
 ```
+
+**Trace output can contain sensitive data.** Traced arguments and return
+values, process state and mailbox samples show whatever the code was
+handling — credentials, tokens, private messages, user records. Treat that
+output like the data itself: do not paste it into write-ups, notes or commits
+beyond what the diagnosis needs, and remember that `beam-debug capture`
+persists it to the state directory (`${XDG_STATE_HOME:-~/.local/state}/beam-debug/`),
+where it stays until you delete it.
 
 ### Observe without editing the repository
 
@@ -169,10 +190,20 @@ precompiled first; an explicit `--no-compile` is respected. A tracer that
 existed before the probe is never replaced silently — pass `--replace-tracer`
 to take it over deliberately.
 
-Tracing is always bounded: it stops at exactly `--limit` events (default 200)
-and after `--for` milliseconds if given. Keep the target specific — a bare
-`Mod` traces every function in the module and will flood a busy run. Erlang
-modules use the `:mod`, `:mod.fun`, `:mod.fun/arity` form.
+`--limit` (default 200) is an **output limit**: exactly that many events are
+printed, tracing is disabled at the source the moment event N is processed,
+and whatever queued past the limit is discarded rather than drained. It is
+not a complete resource bound — a very hot target can queue events faster
+than they print, which costs memory and time while it lasts; above an
+internal queue threshold the trace aborts itself with an explicit
+`trace overloaded` warning instead of exhausting the VM. So keep the target
+specific — a bare `Mod` traces every function in the module and will flood a
+busy run. `--for` stops after a wall-clock window, preserving pre-cutoff
+events. Erlang modules use the `:mod`, `:mod.fun`, `:mod.fun/arity` form.
+
+Every trace is one session with a unique identity, and duration expiry,
+limit completion and explicit stops act on that session only — a stale timer
+from an earlier trace can never stop a later one.
 
 `beam-debug snapshot` runs a command with a watchdog that fires at a
 wall-clock time you choose — measured from the start of the wrapped task,
@@ -235,17 +266,29 @@ BeamDebug.trace_calls({MyServer, :handle_call, 3}, limit: 50)
 ### Inline instrumentation, as a fallback
 
 Still the fastest check for an already-localized data-flow error. Mark every
-temporary line and remove it in the same turn:
+temporary line with the literal `BEAMDBG` marker in the language's own
+comment syntax and remove it in the same turn:
 
 ```elixir
 result = expensive_step(input)
 IO.inspect(result, label: "BEAMDBG expensive_step") # BEAMDBG
 ```
 
+```erlang
+Result = expensive_step(Input),
+io:format("BEAMDBG expensive_step ~p~n", [Result]), % BEAMDBG
+```
+
 ```bash
 mix test test/my_test.exs:123
 beam-debug assert-clean
 ```
+
+When the optional Stop hook is installed, start a marker session first:
+`beam-debug begin` prints a token, temporary lines carry it
+(`# BEAMDBG:<token>`, `% BEAMDBG:<token>`), and `beam-debug end <token>`
+verifies they are gone. The hook then checks exactly those lines and nothing
+else. Without hooks the plain marker plus `assert-clean` is enough.
 
 `beam-debug capture -- ...` is optional. It tees output to a per-repository file
 under `${XDG_STATE_HOME:-~/.local/state}/beam-debug/` while preserving the
@@ -331,24 +374,47 @@ with the toolchain and the skill uses them directly.
 
 ## Cleanup guard semantics
 
-The guard protects the inline-instrumentation fallback. It is no longer the
+The guard protects the inline-instrumentation fallback. It is not the
 architectural centre of the package — `trace` and `snapshot` edit nothing and
 need no cleanup — but inline `dbg()` remains the right tool often enough that
 cheap protection for it is worth keeping.
 
-The scanner looks only at **newly-added lines** in staged/unstaged diffs and at
-untracked `.ex`/`.exs` files. It does not block because an old committed file
-happens to contain the string `BEAMDBG`.
+Two layers, with very different authority:
 
-The optional Stop hook:
+**Manual, whole-worktree** — `beam-debug scan` and `beam-debug assert-clean`
+look at newly-added lines in staged/unstaged diffs and at untracked `.ex`,
+`.exs`, `.erl` and `.hrl` files. They never block because an old committed
+file happens to contain the string `BEAMDBG`. They are explicit commands: run
+them when *you* want the whole worktree checked.
 
-- returns a continuation instruction when new markers remain;
-- allows the next stop even if markers still remain, while surfacing a warning,
-  so a bad condition cannot trap the CLI in a loop;
+**Automatic, session-owned** — the optional Stop hook enforces ownership or
+nothing. A global "any `BEAMDBG` anywhere in this dirty worktree?" check is
+fundamentally unsound in a shared worktree: it cannot distinguish this
+session's forgotten instrumentation from another agent's active work,
+intentional fixtures, or unrelated preexisting changes, and it would hijack
+the completion of tasks that never touched Elixir at all. The hook therefore:
+
+- acts only when the stopping session itself ran `beam-debug begin`, which
+  binds a marker token to that agent session's id (`CLAUDE_CODE_SESSION_ID`
+  is provided to shell commands; the Stop event carries the matching
+  `session_id`);
+- checks only lines carrying that session's own `BEAMDBG:<token>` marker;
+- blocks at most once, listing exact locations, and instructs the agent to
+  remove **only those lines** — other markers are explicitly out of scope;
+- allows the next stop even if markers remain, surfacing a warning, so a bad
+  condition cannot trap the CLI in a loop;
+- fails open — no session metadata, no repository, no ledger, no owned entry,
+  or any internal error all mean the stop proceeds silently; it never falls
+  back to a global scan;
 - never edits source files itself.
 
-The agent remains responsible for removing the exact temporary instrumentation
-it introduced.
+On Codex, session metadata in hook payloads is less established; when the
+expected fields are absent the hook simply stays inert, and `assert-clean`
+remains the manual fallback there.
+
+The agent remains responsible for removing the exact temporary
+instrumentation it introduced — the guard exists to remind, not to police the
+repository.
 
 ## Verify the installation
 
@@ -359,25 +425,33 @@ beam-debug doctor
 ```
 
 The smoke test checks shell/Python syntax, compilation of the BEAM helper and
-both probes when `elixirc` is available, marker detection, CLI argument
-validation, journal round-tripping, idempotent install, hook JSON merging, and
-uninstall behavior in an isolated temporary home. It also asserts that
-`beam-debug test` never gains an implicit `--trace`.
+both probes when `elixirc` is available, marker detection in Elixir and
+Erlang sources (staged, unstaged and untracked), the session-owned Stop-hook
+semantics (fail-open without a ledger or session metadata, ownership block,
+other-session allow, one-shot continuation, `begin`/`end` round-trip), CLI
+argument validation, journal round-tripping, idempotent install, hook JSON
+merging and removal, and uninstall behavior in an isolated temporary home. It
+also asserts that `beam-debug test` never gains an implicit `--trace`.
 
 The integration suite generates throwaway Mix projects and drives `trace` and
 `snapshot` end to end through the real CLI: a fast first invocation is
 captured, clean compiles and recompiles keep the trace, absent targets fail
-loudly, `--limit` stops exactly at the limit, reaching the limit releases
-ownership for the next trace, `--for` preserves pre-cutoff events, a
-test-file-defined module is traced via the late-load path, a pre-existing
-tracer is refused without `--replace-tracer` and taken over with it,
-`--no-compile` is respected, wrapped exit statuses (pass, test failure,
-compile failure, unknown task) pass through both wrappers, snapshotting an
-ordinary GenServer does not crash it, a huge mailbox is not copied, a
-zero-mailbox blocked process appears in hang diagnostics, and supervisor
-children come only from `--supervisors`. CI runs both suites across several
-OTP/Elixir combinations; locally they run on the installed toolchain and skip
-cleanly when elixir is unavailable.
+loudly, `--limit` stops output exactly at the limit, reaching the limit
+releases ownership for the next trace, an overloaded trace aborts explicitly
+and releases ownership, a stale duration timer cannot stop a newer trace
+session, invalid limit/duration/arity values are rejected without leaving
+partial trace state, `--for` preserves pre-cutoff events, a test-file-defined
+module is traced via the late-load path, a pre-existing tracer — including
+raw call tracing attached to a single existing PID — is refused without
+`--replace-tracer` (and left untouched by the refusal) and taken over with
+it, a `:dbg` session started while BeamDebug traces survives ordinary
+shutdown, `--no-compile` is respected, wrapped exit statuses (pass, test
+failure, compile failure, unknown task) pass through both wrappers,
+snapshotting an ordinary GenServer does not crash it, a huge mailbox is not
+copied, a zero-mailbox blocked process appears in hang diagnostics, and
+supervisor children come only from `--supervisors`. CI runs both suites
+across several OTP/Elixir combinations; locally they run on the installed
+toolchain and skip cleanly when elixir is unavailable.
 
 Two failure modes the implementation specifically engineers around, worth
 knowing if you modify it:
@@ -387,10 +461,10 @@ knowing if you modify it:
   uses raw `:erlang.trace/3` and `:erlang.trace_pattern/3` with a plain,
   inspectable tracer process instead of `:dbg`.
 - Trace messages are delivered asynchronously and `mix test` halts the VM as
-  soon as the suite finishes. The probe task flushes right after the wrapped
-  task returns — waiting on `:erlang.trace_delivered/1`, then syncing the
-  tracer with a message round-trip — with a `System.at_exit` hook as backstop
-  for direct `trace_calls/2` use.
+  soon as the suite finishes. The probe task stops the session right after
+  the wrapped task returns — waiting on `:erlang.trace_delivered/1`, then
+  syncing the tracer with a message round-trip — with a `System.at_exit`
+  hook as backstop for direct `trace_calls/2` use.
 
 ## Uninstall
 

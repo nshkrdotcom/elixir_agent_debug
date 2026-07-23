@@ -108,8 +108,12 @@ be missed. Modules that only come into existence while the wrapped task runs
 (for example, defined inside a test file) get best-effort late-load
 attachment, announced up front; either way a target that never loads or
 matches nothing fails the run with an explicit diagnostic instead of printing
-nothing. Tracing stops at exactly `--limit` events (default 200) and after
-`--for` milliseconds if given.
+nothing. `--limit` (default 200) bounds *output* — that many events print,
+then tracing is disabled at the source and the queued excess is discarded.
+It is not a full resource bound: a very hot target can queue events faster
+than they print, and above an internal queue threshold the trace aborts with
+a `trace overloaded` warning. `--for` stops after a wall-clock window,
+preserving pre-cutoff events.
 
 The wrapped command is `mix test` or another Mix task that tolerates being
 precompiled first; an explicit `--no-compile` in the wrapped command is
@@ -175,7 +179,8 @@ check for an already-localized data-flow error — when you know the function, t
 values are in one pipeline, and constructing a correct trace would take longer
 than reading the output. Use it there without apology.
 
-Every temporary source line must contain the literal marker `# BEAMDBG`:
+Every temporary source line must contain the literal `BEAMDBG` marker in the
+language's own comment syntax — `# BEAMDBG` in Elixir, `% BEAMDBG` in Erlang:
 
 ```elixir
 input
@@ -184,12 +189,30 @@ input
 |> persist()
 ```
 
+```erlang
+Value = normalize(Input),
+io:format("BEAMDBG normalize -> ~p~n", [Value]), % BEAMDBG
+```
+
+Optionally, run `beam-debug begin` first: it prints a session token, marked
+lines then carry it (`# BEAMDBG:<token>`, `% BEAMDBG:<token>`), and
+`beam-debug end <token>` verifies your own markers are gone at the end. Use
+this form when a Stop cleanup hook is installed — the hook checks only your
+session's tokened markers and ignores everyone else's. Never remove BEAMDBG
+markers you did not add this session: in a shared worktree they may be
+another session's live instrumentation or committed fixtures.
+
 Remove the marked lines as soon as they confirm or kill the hypothesis. Do not
 leave instrumentation "for later." Adding several probes in one run is fine —
 that is one experiment with a wide aperture, not several speculative changes.
 
 Use `beam-debug capture -- <command>` when preserving the output as a log helps.
 Do not pipe an interactive pry session through capture.
+
+Traced arguments, return values, process state and mailbox samples can
+contain credentials, tokens or private user data. Do not persist or repeat
+sensitive values beyond what the diagnosis needs — `beam-debug capture`
+writes them to a log under the state directory that outlives the session.
 
 ## Flaky and order-dependent failures
 
@@ -273,6 +296,10 @@ profilers (`mix profile.eprof`, `mix profile.cprof`, `mix profile.fprof`) and
 beam-debug assert-clean
 git diff --check
 ```
+
+If you started a marker session with `beam-debug begin`, finish it:
+`beam-debug end <token>` verifies your own markers are gone and retires the
+ledger entry.
 
 Then run the narrowest relevant regression test. If the failure was flaky, re-run
 with the recorded seed and `--repeat-until-failure`. Run broader tests only when
