@@ -621,7 +621,7 @@ if scenario trace-preserves-failure-status; then
     "$BEAM_DEBUG" trace Demo.compute/1 -- mix test test/failing_test.exs
   if [[ "$STATUS" -ne 0 ]] &&
      expect_contains trace-preserves-failure-status 'call Demo\.compute/1' &&
-     expect_contains trace-preserves-failure-status 'Failed: 1 test'; then
+     expect_contains trace-preserves-failure-status 'Failed: 1 test|1 test, 1 failure'; then
     pass trace-preserves-failure-status
   else
     printf '  expected nonzero status with trace output (status %s)\n' "$STATUS" >&2
@@ -707,7 +707,7 @@ if scenario snapshot-does-not-crash-genserver; then
     "$BEAM_DEBUG" snapshot --after 1500 --names Demo.Worker -- mix test test/worker_test.exs
   if [[ "$STATUS" -eq 0 ]] &&
      expect_contains snapshot-does-not-crash-genserver 'demo_state_marker_7519' &&
-     expect_contains snapshot-does-not-crash-genserver 'Result: 1 passed'; then
+     expect_contains snapshot-does-not-crash-genserver 'Result: 1 passed|1 test, 0 failures'; then
     pass snapshot-does-not-crash-genserver
   else
     printf '  expected passing test and the state marker (status %s)\n' "$STATUS" >&2
@@ -744,7 +744,7 @@ if scenario snapshot-preserves-failure-status; then
   # 3b: the snapshot wrapper must also pass a failing status through.
   run snapshot-preserves-failure-status "$PROJECT" -- \
     "$BEAM_DEBUG" snapshot --after 500 -- mix test test/failing_test.exs
-  if [[ "$STATUS" -ne 0 ]] && expect_contains snapshot-preserves-failure-status 'Failed: 1 test'; then
+  if [[ "$STATUS" -ne 0 ]] && expect_contains snapshot-preserves-failure-status 'Failed: 1 test|1 test, 1 failure'; then
     pass snapshot-preserves-failure-status
   else
     printf '  expected nonzero status (status %s)\n' "$STATUS" >&2
@@ -758,7 +758,7 @@ if scenario snapshot-explicit-supervisors; then
     "$BEAM_DEBUG" snapshot --after 1500 --supervisors Demo.Sup -- mix test test/sup_test.exs
   if [[ "$STATUS" -eq 0 ]] &&
      expect_contains snapshot-explicit-supervisors 'Demo\.Worker' &&
-     expect_contains snapshot-explicit-supervisors 'Result: 1 passed'; then
+     expect_contains snapshot-explicit-supervisors 'Result: 1 passed|1 test, 0 failures'; then
     pass snapshot-explicit-supervisors
   else
     printf '  expected passing test and a children listing (status %s)\n' "$STATUS" >&2
