@@ -1,4 +1,4 @@
-# Bounded :dbg call-trace probe. Loaded by `beam-debug trace` via
+# Bounded call-trace probe. Loaded by `beam-debug trace` via
 # `elixir -r ... -S mix beam_debug.trace <task> <args>`, never by the project.
 # It lives outside the source tree so no repository file is edited and nothing
 # has to be cleaned up afterwards.
@@ -33,39 +33,50 @@ defmodule Mix.Tasks.BeamDebug.Trace do
 
     limit = int_env("BEAM_DEBUG_TRACE_LIMIT", 200)
     duration = int_env("BEAM_DEBUG_TRACE_FOR", 0)
+    replace = System.get_env("BEAM_DEBUG_TRACE_REPLACE") == "1"
 
-    Mix.Task.run("compile", [])
+    # Respect an explicit --no-compile on the wrapped command: set up the load
+    # paths for the existing build instead of compiling behind the flag's back.
+    if "--no-compile" in args do
+      Mix.Task.run("loadpaths", [])
+    else
+      Mix.Task.run("compile", [])
+    end
 
     {module, _function, _arity} = mfa = BeamDebug.parse_target(target)
 
     if Code.ensure_loaded?(module) do
-      install!(mfa, target, limit, duration)
+      install!(mfa, target, limit, duration, replace)
     else
-      watch_for_late_load(mfa, target, limit, duration)
+      watch_for_late_load(mfa, target, limit, duration, replace)
     end
 
     Mix.Task.run(wrapped, args)
 
     # Flush while the io system is still healthy: waiting until at_exit can
     # lose events, because the VM halts while the tty server may still be
-    # sitting on the tracer's writes.
+    # sitting on the tracer's writes. stop_calls then releases the trace and
+    # its ownership state before shutdown callbacks run.
     BeamDebug.flush_trace()
-
-    if Process.whereis(:dbg) do
-      BeamDebug.stop_calls()
-    end
+    BeamDebug.stop_calls()
 
     :ok
   end
 
-  defp install!(mfa, target, limit, duration) do
-    case BeamDebug.trace_calls(mfa, limit: limit, for: duration, replace: true) do
+  defp install!(mfa, target, limit, duration, replace) do
+    case BeamDebug.trace_calls(mfa, limit: limit, for: duration, replace: replace) do
       {:ok, matched} when matched > 0 ->
         :ok
 
       {:ok, 0} ->
         Mix.raise(
           "beam_debug.trace: #{target} matched no functions; check the function name and arity"
+        )
+
+      {:error, :tracer_already_running} ->
+        Mix.raise(
+          "beam_debug.trace: cannot trace #{target}: :tracer_already_running — " <>
+            "a tracer existed before the probe; rerun with --replace-tracer to take it over"
         )
 
       {:error, reason} ->
@@ -77,14 +88,14 @@ defmodule Mix.Tasks.BeamDebug.Trace do
   # file the wrapped task loads later, such as a test file). Watch for it, but
   # never let the run end in silence: if the trace was not installed by VM
   # shutdown, say so and fail.
-  defp watch_for_late_load(mfa, target, limit, duration) do
+  defp watch_for_late_load(mfa, target, limit, duration, replace) do
     IO.puts(
       :stderr,
       "[BEAMDBG] #{target}: module not loaded after compile; watching for a late load"
     )
 
     :persistent_term.put(@outcome_key, :pending)
-    spawn(fn -> poll(mfa, target, limit, duration) end)
+    spawn(fn -> poll(mfa, target, limit, duration, replace) end)
 
     System.at_exit(fn _status ->
       case :persistent_term.get(@outcome_key, :installed) do
@@ -106,9 +117,9 @@ defmodule Mix.Tasks.BeamDebug.Trace do
     end)
   end
 
-  defp poll({module, _, _} = mfa, target, limit, duration) do
+  defp poll({module, _, _} = mfa, target, limit, duration, replace) do
     if Code.ensure_loaded?(module) do
-      case BeamDebug.trace_calls(mfa, limit: limit, for: duration, replace: true) do
+      case BeamDebug.trace_calls(mfa, limit: limit, for: duration, replace: replace) do
         {:ok, matched} when matched > 0 ->
           :persistent_term.put(@outcome_key, :installed)
 
@@ -120,7 +131,7 @@ defmodule Mix.Tasks.BeamDebug.Trace do
       end
     else
       Process.sleep(@poll_ms)
-      poll(mfa, target, limit, duration)
+      poll(mfa, target, limit, duration, replace)
     end
   end
 

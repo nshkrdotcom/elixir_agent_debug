@@ -9,7 +9,8 @@ fail() {
 }
 
 printf 'Checking syntax...\n'
-bash -n "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/bin/beam-debug" "$ROOT/tests/smoke.sh"
+bash -n "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/bin/beam-debug" \
+  "$ROOT/tests/smoke.sh" "$ROOT/tests/integration.sh"
 python3 -m py_compile "$ROOT/hooks/stop_guard.py" "$ROOT/lib/manage_install.py" "$ROOT/lib/journal.py"
 
 printf 'Checking that test runs are not silently serialized...\n'

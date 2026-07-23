@@ -28,6 +28,10 @@ defmodule BeamDebug do
   # (with an explicit note) instead of fetching stacktraces node-wide.
   @census_max_processes 400
 
+  # At most this many distinct stack groups are printed by the census, largest
+  # first; the number of omitted groups is reported, never silently dropped.
+  @census_max_groups 20
+
   # --- single-process observation -------------------------------------------
 
   def state(target, timeout \\ 5_000), do: :sys.get_state(target, timeout)
@@ -64,7 +68,9 @@ defmodule BeamDebug do
   The mailbox is sampled only when the queue is at most
   #{@mailbox_sample_threshold} messages long; a longer queue is reported as
   `{:omitted, {:mailbox_too_large, length}}` because fetching `:messages`
-  copies the entire mailbox.
+  copies the entire mailbox. The check and the fetch are separate
+  `Process.info/2` calls, so a queue can still grow in between — the guarantee
+  is that a mailbox *observed* above the threshold is never fetched.
 
   Sends `:sys.get_state/2` (answered by OTP behaviours only) but never the
   supervisor protocol: use `supervisor_children/2` explicitly for supervisors.
@@ -195,8 +201,11 @@ defmodule BeamDebug do
   in two passes: a cheap node-wide scan first, stacktraces only for the small
   ranked groups that the scan selects (busiest mailboxes, busiest schedulers,
   largest memory, and — when the node is small enough — a census of blocked
-  application processes, because a deadlocked process usually has an *empty*
-  mailbox).
+  non-runtime processes — waiting, empty mailbox, executing code outside the
+  Erlang/Elixir installation — because a deadlocked process usually has an
+  *empty* mailbox). The census runs only on nodes with at most
+  #{@census_max_processes} processes and prints at most #{@census_max_groups}
+  stack groups, reporting what it omitted.
 
   Options: `top:` (mailbox group size, default 10), `supervisors:` (names to
   query with `supervisor_children/2`), `device:` (default `:stderr`).
@@ -289,9 +298,12 @@ defmodule BeamDebug do
 
   Returns `{:ok, matched}` where `matched` is the number of functions the
   pattern matched — zero means the target exists but nothing will ever be
-  traced. If a tracer (ours or a `:dbg` session) already exists it is left
-  untouched and `{:error, :tracer_already_running}` is returned; pass
-  `replace: true` to deliberately take tracing over.
+  traced, and the session is cleaned up immediately. If an existing tracer is
+  detected — BeamDebug's own, a running `:dbg` server, or a legacy raw tracer
+  on `:new_processes` — it is left untouched and
+  `{:error, :tracer_already_running}` is returned; pass `replace: true` to
+  deliberately take tracing over. Isolated trace sessions created via the
+  `:trace` module cannot be detected.
 
       BeamDebug.trace_calls({MyApp.Worker, :handle_call, 3}, limit: 50)
       BeamDebug.trace_calls(MyApp.Worker)
@@ -319,20 +331,27 @@ defmodule BeamDebug do
             "limit=#{limit} for=#{duration}ms matched=#{matched}"
         )
 
-        if duration > 0 do
-          spawn(fn ->
-            Process.sleep(duration)
-            stop_calls()
-            IO.puts(device, "[BEAMDBG] trace window elapsed; tracing stopped")
-          end)
-        end
+        if matched == 0 do
+          # A pattern that matched nothing will never produce an event, and a
+          # reloaded module would need a fresh pattern anyway: leave no dead
+          # session behind that would block the next trace.
+          stop_calls()
+        else
+          if duration > 0 do
+            spawn(fn ->
+              Process.sleep(duration)
+              stop_calls()
+              IO.puts(device, "[BEAMDBG] trace window elapsed; tracing stopped")
+            end)
+          end
 
-        # Trace messages are delivered asynchronously, and `mix test` halts
-        # the VM as soon as the suite finishes. Without this hook a fast test
-        # loses every trace event it produced. The probe task also flushes
-        # right after the wrapped task returns, which is earlier and safer —
-        # this hook is the backstop for direct trace_calls/2 use.
-        System.at_exit(fn _ -> flush_trace() end)
+          # Trace messages are delivered asynchronously, and `mix test` halts
+          # the VM as soon as the suite finishes. Without this hook a fast test
+          # loses every trace event it produced. The probe task also flushes
+          # right after the wrapped task returns, which is earlier and safer —
+          # this hook is the backstop for direct trace_calls/2 use.
+          System.at_exit(fn _ -> flush_trace() end)
+        end
 
         {:ok, matched}
 
@@ -378,24 +397,48 @@ defmodule BeamDebug do
     :ok
   end
 
-  def stop_calls do
+  @doc """
+  Ordered trace shutdown, safe to call from any process at any time:
+  disable the pattern and trace flags, wait for already-generated trace
+  messages to be delivered, sync the tracer so they are printed, stop the
+  tracer, erase ownership state. Used by duration expiry, limit completion,
+  zero-match cleanup and the probe's wrapped-task completion alike.
+  """
+  def stop_calls(timeout \\ 2_000) do
     case :persistent_term.get({BeamDebug, :trace_pattern}, nil) do
-      {_, _, _} = pattern ->
-        disable_tracing(pattern)
-        :persistent_term.erase({BeamDebug, :trace_pattern})
-
-      _ ->
-        :ok
+      {_, _, _} = pattern -> disable_tracing(pattern)
+      _ -> :ok
     end
 
     case :persistent_term.get({BeamDebug, :tracer}, nil) do
       tracer when is_pid(tracer) ->
-        if Process.alive?(tracer), do: send(tracer, :beamdbg_stop)
-        :persistent_term.erase({BeamDebug, :tracer})
+        if Process.alive?(tracer) do
+          reference = :erlang.trace_delivered(:all)
+
+          receive do
+            {:trace_delivered, _, ^reference} -> :ok
+          after
+            timeout -> :ok
+          end
+
+          sync = make_ref()
+          send(tracer, {:beamdbg_sync, self(), sync})
+
+          receive do
+            {^sync, :ok} -> :ok
+          after
+            timeout -> :ok
+          end
+
+          send(tracer, :beamdbg_stop)
+        end
 
       _ ->
         :ok
     end
+
+    :persistent_term.erase({BeamDebug, :trace_pattern})
+    :persistent_term.erase({BeamDebug, :tracer})
 
     # Also clear a :dbg session when taking over from one (replace: true).
     if Process.whereis(:dbg) do
@@ -410,30 +453,6 @@ defmodule BeamDebug do
     end
 
     :ok
-  end
-
-  @doc """
-  Make sure `:dbg` is usable.
-
-  Mix prunes unused OTP applications from the code path, so `runtime_tools` is
-  frequently absent by the time a probe wants to install a trace even though it
-  was reachable at boot. Re-add its ebin directory rather than failing.
-  """
-  def ensure_dbg do
-    cond do
-      Code.ensure_loaded?(:dbg) ->
-        :ok
-
-      true ->
-        case :code.lib_dir(:runtime_tools) do
-          {:error, _} ->
-            {:error, :runtime_tools_unavailable}
-
-          dir ->
-            :code.add_patha(:filename.join(dir, ~c"ebin"))
-            if Code.ensure_loaded?(:dbg), do: :ok, else: {:error, :runtime_tools_unavailable}
-        end
-    end
   end
 
   # --- report sections --------------------------------------------------------
@@ -498,7 +517,8 @@ defmodule BeamDebug do
   # A blocked process usually has an *empty* mailbox, so ranking by queue
   # length alone can omit the one process a hang investigation needs. On a
   # small node: fetch stacks for waiting, empty-mailbox processes and keep the
-  # ones executing application code, grouped by identical stack.
+  # ones executing non-runtime code (anything outside the Erlang/Elixir
+  # installation — the project and its deps), grouped by identical stack.
   defp print_blocked_census(device, scan, total) do
     cond do
       total > @census_max_processes ->
@@ -519,17 +539,20 @@ defmodule BeamDebug do
           |> Enum.flat_map(fn {pid, info} ->
             case current_stack(pid) do
               nil -> []
-              stack -> if app_stack?(stack, prefixes), do: [{pid, info, stack}], else: []
+              stack -> if non_runtime_stack?(stack, prefixes), do: [{pid, info, stack}], else: []
             end
           end)
           |> Enum.group_by(fn {_, _, stack} -> stack end)
+          |> Enum.sort_by(fn {_, entries} -> length(entries) end, :desc)
 
-        if groups == %{} do
-          IO.puts(device, "\n-- no blocked process is executing application code")
+        if groups == [] do
+          IO.puts(device, "\n-- no blocked process is executing non-runtime code")
         else
-          IO.puts(device, "\n-- blocked application processes (waiting, empty mailbox)")
+          IO.puts(device, "\n-- blocked processes in non-runtime code (waiting, empty mailbox)")
 
-          Enum.each(groups, fn {stack, entries} ->
+          groups
+          |> Enum.take(@census_max_groups)
+          |> Enum.each(fn {stack, entries} ->
             names =
               entries
               |> Enum.take(3)
@@ -544,6 +567,12 @@ defmodule BeamDebug do
               IO.puts(device, "      #{Exception.format_stacktrace_entry(frame)}")
             end)
           end)
+
+          omitted = length(groups) - @census_max_groups
+
+          if omitted > 0 do
+            IO.puts(device, "   ... #{omitted} more stack group(s) omitted")
+          end
         end
     end
   end
@@ -592,7 +621,7 @@ defmodule BeamDebug do
 
   defp format_name(_), do: "(unnamed)"
 
-  defp app_stack?(stack, prefixes) do
+  defp non_runtime_stack?(stack, prefixes) do
     Enum.any?(stack, fn
       {module, _f, _a, _location} -> not system_module?(module, prefixes)
       _ -> false
@@ -632,21 +661,34 @@ defmodule BeamDebug do
 
   # --- internals -------------------------------------------------------------
 
+  # Detects our own tracer, a running :dbg server, and legacy raw tracers set
+  # on :new_processes. Isolated trace sessions (:trace.session_create) are
+  # invisible to all of these and cannot be detected.
   defp claim_tracer(replace) do
     ours = :persistent_term.get({BeamDebug, :tracer}, nil)
     ours_alive? = is_pid(ours) and Process.alive?(ours)
     dbg_running? = Process.whereis(:dbg) != nil
 
     cond do
-      not ours_alive? and not dbg_running? ->
+      not ours_alive? and not dbg_running? and foreign_tracer() == nil ->
         :ok
 
       replace ->
         stop_calls()
+        # A foreign legacy tracer is not covered by stop_calls' own state:
+        # clear the flags it left on existing and future processes.
+        safe(fn -> :erlang.trace(:all, false, [:call, :timestamp]) end)
         :ok
 
       true ->
         {:error, :tracer_already_running}
+    end
+  end
+
+  defp foreign_tracer do
+    case safe(fn -> :erlang.trace_info(:new_processes, :tracer) end) do
+      {:ok, {:tracer, tracer}} when tracer != [] -> tracer
+      _ -> nil
     end
   end
 
@@ -680,7 +722,11 @@ defmodule BeamDebug do
 
         if new_count == limit do
           IO.puts(device, "[BEAMDBG] trace limit #{limit} reached; stopping tracing")
+          # Disable immediately to stop the flood, then release ownership from
+          # a separate process (stop_calls syncs with this loop, which keeps
+          # serving its mailbox until the stop message arrives).
           disable_tracing(pattern)
+          spawn(fn -> stop_calls() end)
         end
 
         tracer_loop(pattern, limit, device, new_count)

@@ -29,6 +29,9 @@ Observe without editing source:
                                       :mod | :mod.fun | :mod.fun/arity (Erlang)
                               opts:  --limit N (default 200; stops at event N)
                                      --for MS  (also stop after MS ms)
+                                     --replace-tracer (take over a tracer that
+                                                       existed before the probe;
+                                                       never done silently)
   snapshot [opts] [-- mix ...]
                               Run a command with a watchdog that dumps process
                               state, mailboxes, current stacktraces, links,
@@ -198,7 +201,7 @@ run_with_probe() {
 }
 
 trace() {
-  local target="" limit=200 duration=0
+  local target="" limit=200 duration=0 replace=""
   if [[ $# -eq 0 || "$1" == "--" || "$1" == --* ]]; then
     printf 'beam-debug trace: missing target (Mod | Mod.fun | Mod.fun/arity | :mod.fun/arity)\n' >&2
     exit 2
@@ -211,6 +214,7 @@ trace() {
     case "$1" in
       --limit) require_int --limit "${2-}" 1; limit="$2"; shift 2 ;;
       --for) require_int --for "${2-}" 0; duration="$2"; shift 2 ;;
+      --replace-tracer) replace=1; shift ;;
       --) rest=("$@"); break ;;
       *) printf 'beam-debug trace: unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -219,6 +223,7 @@ trace() {
   export BEAM_DEBUG_TRACE_TARGET="$target"
   export BEAM_DEBUG_TRACE_LIMIT="$limit"
   export BEAM_DEBUG_TRACE_FOR="$duration"
+  export BEAM_DEBUG_TRACE_REPLACE="$replace"
   run_with_probe beam_debug.trace "$PROBE_TRACE" "${rest[@]+"${rest[@]}"}"
 }
 

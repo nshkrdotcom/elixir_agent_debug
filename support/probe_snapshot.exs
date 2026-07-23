@@ -31,7 +31,11 @@ defmodule Mix.Tasks.BeamDebug.Snapshot do
     names = BeamDebug.parse_names(System.get_env("BEAM_DEBUG_SNAPSHOT_NAMES"))
     supervisors = BeamDebug.parse_names(System.get_env("BEAM_DEBUG_SNAPSHOT_SUPERVISORS"))
 
-    Mix.Task.run("compile", [])
+    if "--no-compile" in args do
+      Mix.Task.run("loadpaths", [])
+    else
+      Mix.Task.run("compile", [])
+    end
 
     spawn(fn ->
       Process.sleep(after_ms)

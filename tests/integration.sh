@@ -166,6 +166,81 @@ defmodule SupTest do
 end
 EOF
 
+cat > "$PROJECT/test/failing_test.exs" <<'EOF'
+defmodule FailingTest do
+  use ExUnit.Case
+
+  test "fails after calling compute" do
+    assert Demo.compute(9) == :wrong
+  end
+end
+EOF
+
+cat > "$PROJECT/test/late_test.exs" <<'EOF'
+defmodule LateHelper do
+  def double(n), do: n + n
+end
+
+defmodule LateTest do
+  use ExUnit.Case
+
+  test "uses a module defined in this test file" do
+    Process.sleep(300)
+    assert LateHelper.double(150) == 300
+  end
+end
+EOF
+
+cat > "$PROJECT/test/window_test.exs" <<'EOF'
+defmodule WindowTest do
+  use ExUnit.Case
+  @moduletag timeout: 30_000
+
+  test "calls before and after the trace window" do
+    Demo.compute(300)
+    Process.sleep(6_000)
+    Demo.compute(301)
+  end
+end
+EOF
+
+# A second project whose mix.exs starts a :dbg session at project-load time,
+# i.e. before any probe can install — a genuine pre-existing tracer.
+CONFLICT="$WORK/demo2"
+mkdir -p "$CONFLICT/lib" "$CONFLICT/test"
+
+cat > "$CONFLICT/mix.exs" <<'EOF'
+{:ok, _} = :dbg.tracer()
+
+defmodule Demo2.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo2, version: "0.1.0", deps: []]
+  end
+end
+EOF
+
+cat > "$CONFLICT/lib/demo2.ex" <<'EOF'
+defmodule Demo2 do
+  def ping(n), do: n
+end
+EOF
+
+cat > "$CONFLICT/test/test_helper.exs" <<'EOF'
+ExUnit.start()
+EOF
+
+cat > "$CONFLICT/test/ping_test.exs" <<'EOF'
+defmodule PingTest do
+  use ExUnit.Case
+
+  test "pings" do
+    assert Demo2.ping(170) == 170
+  end
+end
+EOF
+
 # --- harness ------------------------------------------------------------------
 
 # run <scenario-name> <working-dir> [--expect-status N] -- command...
@@ -269,6 +344,43 @@ if scenario helper-replace-guard; then
     pass helper-replace-guard
   else
     fail_scenario helper-replace-guard
+  fi
+fi
+
+if scenario helper-restart-after-limit; then
+  # 1c: reaching the limit must release ownership so a new trace can start.
+  run helper-restart-after-limit "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:ok, _} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: 2)
+    :lists.reverse([1, 2, 3])
+    BeamDebug.flush_trace()
+    Process.sleep(300)
+    case BeamDebug.trace_calls({:lists, :seq, 2}, limit: 5) do
+      {:ok, _} -> IO.puts("RESTART-OK")
+      other -> IO.puts("RESTART-FAILED #{inspect(other)}")
+    end
+    BeamDebug.stop_calls()
+  '
+  if expect_contains helper-restart-after-limit 'RESTART-OK'; then
+    pass helper-restart-after-limit
+  else
+    fail_scenario helper-restart-after-limit
+  fi
+fi
+
+if scenario helper-zero-match-clean; then
+  # 1c: a zero-match trace is useless and must leave no live session behind.
+  run helper-zero-match-clean "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:ok, 0} = BeamDebug.trace_calls({:lists, :nosuchfun, 9})
+    case BeamDebug.trace_calls({:lists, :seq, 2}, limit: 5) do
+      {:ok, n} when n > 0 -> IO.puts("ZERO-MATCH-CLEAN")
+      other -> IO.puts("ZERO-MATCH-DIRTY #{inspect(other)}")
+    end
+    BeamDebug.stop_calls()
+  '
+  if expect_contains helper-zero-match-clean 'ZERO-MATCH-CLEAN'; then
+    pass helper-zero-match-clean
+  else
+    fail_scenario helper-zero-match-clean
   fi
 fi
 
@@ -385,11 +497,13 @@ if scenario trace-fast-first-call; then
   # A3: the very first invocation in a fast test must be captured.
   run trace-fast-first-call "$PROJECT" -- \
     "$BEAM_DEBUG" trace Demo.compute/1 -- mix test test/fast_test.exs
-  if expect_contains trace-fast-first-call 'call Demo\.compute/1' &&
+  if [[ "$STATUS" -eq 0 ]] &&
+     expect_contains trace-fast-first-call 'call Demo\.compute/1' &&
      expect_contains trace-fast-first-call 'args: \[200\]' &&
      expect_contains trace-fast-first-call 'value: 20100'; then
     pass trace-fast-first-call
   else
+    printf '  expected status 0 (got %s) with traced events\n' "$STATUS" >&2
     fail_scenario trace-fast-first-call
   fi
 fi
@@ -449,7 +563,7 @@ if scenario trace-limit-stops; then
   run trace-limit-stops "$PROJECT" -- \
     "$BEAM_DEBUG" trace Demo.compute/1 --limit 3 -- mix test test/many_test.exs
   events="$(grep -Ec '(call|return) Demo\.compute/1' "$OUT")"
-  if [[ "$events" -le 3 && "$events" -ge 1 ]] &&
+  if [[ "$STATUS" -eq 0 && "$events" -le 3 && "$events" -ge 1 ]] &&
      expect_contains trace-limit-stops 'trace limit 3 reached'; then
     pass trace-limit-stops
   else
@@ -462,10 +576,127 @@ if scenario trace-erlang-module; then
   # E3 end to end: Erlang modules are traceable with the `:mod` syntax.
   run trace-erlang-module "$PROJECT" -- \
     "$BEAM_DEBUG" trace :lists.seq/2 --limit 6 -- mix test test/fast_test.exs
-  if expect_contains trace-erlang-module 'call :lists\.seq/2'; then
+  if [[ "$STATUS" -eq 0 ]] && expect_contains trace-erlang-module 'call :lists\.seq/2'; then
     pass trace-erlang-module
   else
     fail_scenario trace-erlang-module
+  fi
+fi
+
+if scenario trace-late-module; then
+  # 2b: a module defined only inside a test file uses the late-load path and
+  # must still be traced, with the fallback announced.
+  run trace-late-module "$PROJECT" -- \
+    "$BEAM_DEBUG" trace LateHelper.double/1 -- mix test test/late_test.exs
+  if [[ "$STATUS" -eq 0 ]] &&
+     expect_contains trace-late-module 'watching for a late load' &&
+     expect_contains trace-late-module 'call LateHelper\.double/1' &&
+     expect_contains trace-late-module 'args: \[150\]'; then
+    pass trace-late-module
+  else
+    printf '  expected late-load notice and traced call (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-late-module
+  fi
+fi
+
+if scenario trace-for-window; then
+  # 1c/1d: events generated before the --for cutoff are preserved; events
+  # after it are not traced.
+  run trace-for-window "$PROJECT" -- \
+    "$BEAM_DEBUG" trace Demo.compute/1 --for 3500 -- mix test test/window_test.exs
+  if [[ "$STATUS" -eq 0 ]] &&
+     expect_contains trace-for-window 'args: \[300\]' &&
+     expect_contains trace-for-window 'trace window elapsed' &&
+     expect_not_contains trace-for-window 'args: \[301\]'; then
+    pass trace-for-window
+  else
+    printf '  expected the pre-cutoff event only (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-for-window
+  fi
+fi
+
+if scenario trace-preserves-failure-status; then
+  # 3b: the wrapper must never mask a failing wrapped test.
+  run trace-preserves-failure-status "$PROJECT" -- \
+    "$BEAM_DEBUG" trace Demo.compute/1 -- mix test test/failing_test.exs
+  if [[ "$STATUS" -ne 0 ]] &&
+     expect_contains trace-preserves-failure-status 'call Demo\.compute/1' &&
+     expect_contains trace-preserves-failure-status 'Failed: 1 test'; then
+    pass trace-preserves-failure-status
+  else
+    printf '  expected nonzero status with trace output (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-preserves-failure-status
+  fi
+fi
+
+if scenario trace-compile-failure-status; then
+  # 3b: a compile failure in the wrapped project must exit nonzero.
+  printf 'defmodule Broken do\n' > "$PROJECT/lib/broken.ex"
+  run trace-compile-failure-status "$PROJECT" -- \
+    "$BEAM_DEBUG" trace Demo.compute/1 -- mix test test/fast_test.exs
+  rm -f "$PROJECT/lib/broken.ex"
+  if [[ "$STATUS" -ne 0 ]]; then
+    pass trace-compile-failure-status
+  else
+    printf '  expected nonzero status for a compile failure (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-compile-failure-status
+  fi
+fi
+
+if scenario trace-invalid-task-status; then
+  # 3b: a nonexistent wrapped Mix task must exit nonzero.
+  run trace-invalid-task-status "$PROJECT" -- \
+    "$BEAM_DEBUG" trace Demo.compute/1 -- mix nosuchtask
+  if [[ "$STATUS" -ne 0 ]]; then
+    pass trace-invalid-task-status
+  else
+    printf '  expected nonzero status for an unknown task (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-invalid-task-status
+  fi
+fi
+
+if scenario trace-refuses-existing-tracer; then
+  # 1a/1d: a tracer that existed before the probe (started by mix.exs at
+  # project-load time) must not be silently destroyed.
+  run trace-refuses-existing-tracer "$CONFLICT" -- \
+    "$BEAM_DEBUG" trace Demo2.ping/1 -- mix test test/ping_test.exs
+  if [[ "$STATUS" -ne 0 ]] &&
+     expect_contains trace-refuses-existing-tracer 'tracer_already_running'; then
+    pass trace-refuses-existing-tracer
+  else
+    printf '  expected refusal without --replace-tracer (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-refuses-existing-tracer
+  fi
+fi
+
+if scenario trace-replace-tracer-flag; then
+  # 1a/1d: --replace-tracer authorizes the takeover, and the trace then works.
+  run trace-replace-tracer-flag "$CONFLICT" -- \
+    "$BEAM_DEBUG" trace Demo2.ping/1 --replace-tracer -- mix test test/ping_test.exs
+  if [[ "$STATUS" -eq 0 ]] &&
+     expect_contains trace-replace-tracer-flag 'call Demo2\.ping/1' &&
+     expect_contains trace-replace-tracer-flag 'args: \[170\]'; then
+    pass trace-replace-tracer-flag
+  else
+    printf '  expected takeover and traced call (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-replace-tracer-flag
+  fi
+fi
+
+if scenario trace-no-compile; then
+  # 4a/4c: --no-compile in the wrapped command is respected — the probe must
+  # not compile modified sources behind the flag's back.
+  (cd "$PROJECT" && MIX_ENV=test mix compile >/dev/null 2>&1)
+  printf '\n# stale marker %s\n' "$RANDOM" >> "$PROJECT/lib/demo.ex"
+  run trace-no-compile "$PROJECT" -- \
+    "$BEAM_DEBUG" trace Demo.compute/1 -- mix test --no-compile test/fast_test.exs
+  if [[ "$STATUS" -eq 0 ]] &&
+     expect_not_contains trace-no-compile 'Compiling' &&
+     expect_contains trace-no-compile 'call Demo\.compute/1'; then
+    pass trace-no-compile
+  else
+    printf '  expected no compilation and a working trace (status %s)\n' "$STATUS" >&2
+    fail_scenario trace-no-compile
   fi
 fi
 
@@ -506,6 +737,18 @@ if scenario snapshot-surfaces-blocked-process; then
     pass snapshot-surfaces-blocked-process
   else
     fail_scenario snapshot-surfaces-blocked-process
+  fi
+fi
+
+if scenario snapshot-preserves-failure-status; then
+  # 3b: the snapshot wrapper must also pass a failing status through.
+  run snapshot-preserves-failure-status "$PROJECT" -- \
+    "$BEAM_DEBUG" snapshot --after 500 -- mix test test/failing_test.exs
+  if [[ "$STATUS" -ne 0 ]] && expect_contains snapshot-preserves-failure-status 'Failed: 1 test'; then
+    pass snapshot-preserves-failure-status
+  else
+    printf '  expected nonzero status (status %s)\n' "$STATUS" >&2
+    fail_scenario snapshot-preserves-failure-status
   fi
 fi
 
