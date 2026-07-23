@@ -53,11 +53,10 @@ defmodule Mix.Tasks.BeamDebug.Trace do
 
     Mix.Task.run(wrapped, args)
 
-    # Flush while the io system is still healthy: waiting until at_exit can
+    # Stop while the io system is still healthy: waiting until at_exit can
     # lose events, because the VM halts while the tty server may still be
-    # sitting on the tracer's writes. stop_calls then releases the trace and
-    # its ownership state before shutdown callbacks run.
-    BeamDebug.flush_trace()
+    # sitting on the tracer's writes. stop_calls drains delivered events and
+    # syncs the tracer itself, so no separate flush is needed first.
     BeamDebug.stop_calls()
 
     :ok

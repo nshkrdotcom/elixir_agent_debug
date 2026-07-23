@@ -285,6 +285,13 @@ defmodule BeamDebug do
 
   def stop_trace(target), do: :sys.trace(target, false)
 
+  # Above this tracer queue length the trace is aborted outright: the target
+  # is generating events far faster than they can be printed, and draining the
+  # backlog would only deepen the perturbation it is meant to observe.
+  @overload_threshold 10_000
+
+  @session_key {BeamDebug, :session}
+
   @doc """
   Bounded call trace of an MFA, including arguments, return values and
   exceptions. Works on local and exported functions and on code you cannot edit.
@@ -293,17 +300,34 @@ defmodule BeamDebug do
   plain tracer process — not on `:dbg`, whose OTP 28 tracer has been observed
   to stop handling events while `mix test` runs, silently losing the trace.
 
-  Always bounded: tracing stops at exactly `:limit` events (default 200) and,
-  if given, after `:for` milliseconds. Call `stop_calls/0` to stop early.
+  `:limit` (default 200) bounds *output*: exactly that many events are
+  printed, tracing is disabled at the source the moment event N is processed,
+  and anything already queued past the limit is discarded rather than drained.
+  A busy target can still queue events faster than they print; above an
+  internal queue threshold the trace aborts with an explicit
+  `trace overloaded` warning instead of exhausting the VM. `:for` additionally
+  stops the trace after that many milliseconds, preserving events generated
+  before the cutoff. Call `stop_calls/0` to stop early.
 
-  Returns `{:ok, matched}` where `matched` is the number of functions the
-  pattern matched — zero means the target exists but nothing will ever be
-  traced, and the session is cleaned up immediately. If an existing tracer is
-  detected — BeamDebug's own, a running `:dbg` server, or a legacy raw tracer
-  on `:new_processes` — it is left untouched and
-  `{:error, :tracer_already_running}` is returned; pass `replace: true` to
-  deliberately take tracing over. Isolated trace sessions created via the
-  `:trace` module cannot be detected.
+  Every trace is one session with a unique identity. Duration expiry, limit
+  completion and explicit stops all act on that session only: a stale timer or
+  a late cleanup from an earlier trace can never stop a newer one.
+
+  Setup is transactional: `limit`, `for` and the target arity are validated
+  first, and if installation fails partway the flags already set are removed,
+  the tracer is terminated, and the session is erased before the error
+  returns. Returns `{:ok, matched}` where `matched` is the number of functions
+  the pattern matched — zero means the target exists but nothing will ever be
+  traced, and the session is cleaned up immediately.
+
+  If an existing tracer is detected — BeamDebug's own, a running `:dbg`
+  server, a legacy raw tracer on `:new_processes`, or raw tracing attached to
+  any existing process — it is left untouched and
+  `{:error, :tracer_already_running}` is returned. Pass `replace: true` to
+  deliberately take tracing over; the takeover stops the foreign tracer once,
+  up front, and ordinary shutdown afterwards touches only BeamDebug-owned
+  state. Isolated trace sessions created via the `:trace` module cannot be
+  detected.
 
       BeamDebug.trace_calls({MyApp.Worker, :handle_call, 3}, limit: 50)
       BeamDebug.trace_calls(MyApp.Worker)
@@ -313,17 +337,70 @@ defmodule BeamDebug do
     duration = Keyword.get(options, :for, 0)
     device = Keyword.get(options, :device, :stderr)
     replace = Keyword.get(options, :replace, false)
-    {module, function, arity} = normalize_mfa(target)
-    pattern = {module, function, arity}
+    overload = Keyword.get(options, :overload_threshold, @overload_threshold)
 
-    case claim_tracer(replace) do
-      :ok ->
-        tracer = spawn(fn -> tracer_loop(pattern, limit, device, 0) end)
-        :persistent_term.put({BeamDebug, :tracer}, tracer)
-        :persistent_term.put({BeamDebug, :trace_pattern}, pattern)
+    result =
+      with :ok <- validate_options(limit, duration, overload),
+           {:ok, pattern} <- validate_target(target),
+           :ok <- claim_tracer(replace, device) do
+        install_trace(pattern, limit, duration, device, overload)
+      end
 
-        :erlang.trace(:all, true, [:call, :timestamp, {:tracer, tracer}])
-        matched = :erlang.trace_pattern(pattern, [{:_, [], [{:exception_trace}]}], [:local])
+    case result do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        IO.puts(device, "[BEAMDBG] cannot trace: #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp validate_options(limit, duration, overload) do
+    cond do
+      not (is_integer(limit) and limit >= 1) -> {:error, {:invalid_limit, limit}}
+      not (is_integer(duration) and duration >= 0) -> {:error, {:invalid_duration, duration}}
+      not (is_integer(overload) and overload >= 1) -> {:error, {:invalid_overload_threshold, overload}}
+      true -> :ok
+    end
+  end
+
+  defp validate_target(target) do
+    case safe(fn -> normalize_mfa(target) end) do
+      {:ok, {module, function, arity}}
+      when is_atom(module) and is_atom(function) and
+             (arity == :_ or (is_integer(arity) and arity >= 0)) ->
+        {:ok, {module, function, arity}}
+
+      _ ->
+        {:error, {:invalid_target, target}}
+    end
+  end
+
+  # Either returns a complete live session or leaves the VM exactly as it
+  # found it: any failure after the flags start going in rolls them back,
+  # kills the new tracer and erases the session before the error returns.
+  defp install_trace(pattern, limit, duration, device, overload) do
+    id = make_ref()
+
+    tracer =
+      spawn(fn ->
+        tracer_loop(
+          %{id: id, pattern: pattern, limit: limit, device: device, overload: overload},
+          0
+        )
+      end)
+
+    # Ownership goes in before the flags so a concurrent trace_calls sees the
+    # claim; the rollback below removes it if installation fails.
+    :persistent_term.put(@session_key, %{id: id, tracer: tracer, pattern: pattern})
+
+    case safe(fn ->
+           :erlang.trace(:all, true, [:call, :timestamp, {:tracer, tracer}])
+           :erlang.trace_pattern(pattern, [{:_, [], [{:exception_trace}]}], [:local])
+         end) do
+      {:ok, matched} ->
+        {module, function, arity} = pattern
 
         IO.puts(
           device,
@@ -335,29 +412,31 @@ defmodule BeamDebug do
           # A pattern that matched nothing will never produce an event, and a
           # reloaded module would need a fresh pattern anyway: leave no dead
           # session behind that would block the next trace.
-          stop_calls()
+          stop_session(id)
         else
           if duration > 0 do
-            spawn(fn ->
-              Process.sleep(duration)
-              stop_calls()
-              IO.puts(device, "[BEAMDBG] trace window elapsed; tracing stopped")
-            end)
+            # The timer targets this session's own tracer. If the session is
+            # stopped first the tracer is dead and the message goes nowhere —
+            # a stale window can never stop a trace it did not start.
+            Process.send_after(tracer, {:beamdbg_window_elapsed, id}, duration)
           end
 
           # Trace messages are delivered asynchronously, and `mix test` halts
           # the VM as soon as the suite finishes. Without this hook a fast test
-          # loses every trace event it produced. The probe task also flushes
-          # right after the wrapped task returns, which is earlier and safer —
-          # this hook is the backstop for direct trace_calls/2 use.
+          # loses every trace event it produced. The probe task also stops the
+          # session right after the wrapped task returns, which is earlier and
+          # safer — this hook is the backstop for direct trace_calls/2 use.
           System.at_exit(fn _ -> flush_trace() end)
         end
 
         {:ok, matched}
 
       {:error, reason} ->
-        IO.puts(device, "[BEAMDBG] cannot trace: #{inspect(reason)}")
-        {:error, reason}
+        safe(fn -> :erlang.trace_pattern(pattern, false, [:local]) end)
+        safe(fn -> :erlang.trace(:all, false, [:call, :timestamp]) end)
+        Process.exit(tracer, :kill)
+        release_session(id)
+        {:error, {:trace_setup_failed, reason}}
     end
   end
 
@@ -370,7 +449,7 @@ defmodule BeamDebug do
   nothing at all.
   """
   def flush_trace(timeout \\ 2_000) do
-    with tracer when is_pid(tracer) <- :persistent_term.get({BeamDebug, :tracer}, nil),
+    with %{tracer: tracer} <- current_session(),
          true <- Process.alive?(tracer) do
       reference = :erlang.trace_delivered(:all)
 
@@ -398,21 +477,32 @@ defmodule BeamDebug do
   end
 
   @doc """
-  Ordered trace shutdown, safe to call from any process at any time:
-  disable the pattern and trace flags, wait for already-generated trace
-  messages to be delivered, sync the tracer so they are printed, stop the
-  tracer, erase ownership state. Used by duration expiry, limit completion,
-  zero-match cleanup and the probe's wrapped-task completion alike.
+  Ordered graceful shutdown of the *current* trace session, safe to call from
+  any process at any time: disable the pattern and trace flags, wait for
+  already-generated trace messages to be delivered, sync the tracer so they
+  are printed, stop the tracer, erase ownership state.
+
+  Scoped strictly to BeamDebug-owned state: a `:dbg` session or foreign
+  tracer is never stopped here — foreign tracers are only ever stopped by an
+  explicit `replace: true` takeover, at takeover time. No-op when no session
+  is live.
   """
   def stop_calls(timeout \\ 2_000) do
-    case :persistent_term.get({BeamDebug, :trace_pattern}, nil) do
-      {_, _, _} = pattern -> disable_tracing(pattern)
+    case current_session() do
+      %{id: id} -> stop_session(id, timeout)
       _ -> :ok
     end
+  end
 
-    case :persistent_term.get({BeamDebug, :tracer}, nil) do
-      tracer when is_pid(tracer) ->
-        if Process.alive?(tracer) do
+  # Stop one specific session. A no-op when that session is no longer
+  # current, so duration expiry, limit completion and late cleanups can never
+  # stop a trace they did not start.
+  defp stop_session(id, timeout \\ 2_000) do
+    case current_session() do
+      %{id: ^id, pattern: pattern, tracer: tracer} ->
+        disable_tracing(pattern)
+
+        if is_pid(tracer) and Process.alive?(tracer) do
           reference = :erlang.trace_delivered(:all)
 
           receive do
@@ -433,26 +523,30 @@ defmodule BeamDebug do
           send(tracer, :beamdbg_stop)
         end
 
+        release_session(id)
+        :ok
+
       _ ->
         :ok
     end
+  end
 
-    :persistent_term.erase({BeamDebug, :trace_pattern})
-    :persistent_term.erase({BeamDebug, :tracer})
+  defp current_session, do: :persistent_term.get(@session_key, nil)
 
-    # Also clear a :dbg session when taking over from one (replace: true).
-    if Process.whereis(:dbg) do
-      # :dbg.stop_clear/0 is deprecated and removed in recent OTP; :dbg.stop/0
-      # is present across versions. apply/3 keeps the deprecation warning out
-      # of the compile output on the versions where both still exist.
-      if function_exported?(:dbg, :stop_clear, 0) do
-        apply(:dbg, :stop_clear, [])
-      else
-        apply(:dbg, :stop, [])
-      end
+  defp current_session_id do
+    case current_session() do
+      %{id: id} -> id
+      _ -> nil
     end
+  end
 
-    :ok
+  # Erase ownership only if this session still holds it: a newer session's
+  # state must never be erased by an older session's cleanup.
+  defp release_session(id) do
+    case current_session() do
+      %{id: ^id} -> :persistent_term.erase(@session_key)
+      _ -> :ok
+    end
   end
 
   # --- report sections --------------------------------------------------------
@@ -661,22 +755,36 @@ defmodule BeamDebug do
 
   # --- internals -------------------------------------------------------------
 
-  # Detects our own tracer, a running :dbg server, and legacy raw tracers set
-  # on :new_processes. Isolated trace sessions (:trace.session_create) are
-  # invisible to all of these and cannot be detected.
-  defp claim_tracer(replace) do
-    ours = :persistent_term.get({BeamDebug, :tracer}, nil)
-    ours_alive? = is_pid(ours) and Process.alive?(ours)
+  # Detects our own tracer, a running :dbg server, legacy raw tracers set on
+  # :new_processes, and raw tracing attached to selected existing processes.
+  # Isolated trace sessions (:trace.session_create) are invisible to all of
+  # these and cannot be detected.
+  defp claim_tracer(replace, device) do
+    session = current_session()
+    ours_alive? = match?(%{tracer: tracer} when is_pid(tracer), session) and Process.alive?(session.tracer)
     dbg_running? = Process.whereis(:dbg) != nil
 
     cond do
       not ours_alive? and not dbg_running? and foreign_tracer() == nil ->
+        # A session whose tracer died uncleanly must not block forever; its
+        # trace flags disappeared with the tracer.
+        if session != nil, do: release_session(session.id)
         :ok
 
       replace ->
-        stop_calls()
-        # A foreign legacy tracer is not covered by stop_calls' own state:
-        # clear the flags it left on existing and future processes.
+        # Takeover is the one authorized moment to stop foreign tracing, and
+        # everything stopped here is announced. Ordinary shutdown afterwards
+        # cleans up only BeamDebug-owned state.
+        if session != nil, do: stop_session(session.id)
+
+        if dbg_running? do
+          IO.puts(device, "[BEAMDBG] replace: stopping the running :dbg session")
+          stop_dbg()
+        end
+
+        # The legacy trace API has no tracer-scoped disable, so clearing the
+        # flags a foreign raw tracer left behind is necessarily global. That
+        # is exactly what --replace-tracer authorizes.
         safe(fn -> :erlang.trace(:all, false, [:call, :timestamp]) end)
         :ok
 
@@ -685,11 +793,36 @@ defmodule BeamDebug do
     end
   end
 
+  defp stop_dbg do
+    # :dbg.stop_clear/0 is deprecated and removed in recent OTP; :dbg.stop/0
+    # is present across versions. apply/3 keeps the deprecation warning out
+    # of the compile output on the versions where both still exist.
+    if function_exported?(:dbg, :stop_clear, 0) do
+      apply(:dbg, :stop_clear, [])
+    else
+      apply(:dbg, :stop, [])
+    end
+  end
+
   defp foreign_tracer do
     case safe(fn -> :erlang.trace_info(:new_processes, :tracer) end) do
       {:ok, {:tracer, tracer}} when tracer != [] -> tracer
-      _ -> nil
+      _ -> foreign_pid_tracer()
     end
+  end
+
+  # Raw call tracing can be attached to selected existing PIDs without
+  # touching :new_processes. Detect it, because our shutdown's
+  # trace(:all, false) would silently wipe such a trace — the legacy API has
+  # no tracer-scoped disable — so coexistence is impossible and the honest
+  # options are refusing or an authorized takeover.
+  defp foreign_pid_tracer do
+    Enum.find_value(Process.list(), fn pid ->
+      case safe(fn -> :erlang.trace_info(pid, :tracer) end) do
+        {:ok, {:tracer, tracer}} when tracer != [] -> tracer
+        _ -> nil
+      end
+    end)
   end
 
   defp disable_tracing(pattern) do
@@ -704,14 +837,31 @@ defmodule BeamDebug do
   # A plain spawned process, deliberately not a :dbg tracer: it may print, be
   # inspected, and keep serving its mailbox in order, so a sync round-trip
   # proves everything delivered before it has been written out.
-  defp tracer_loop(pattern, limit, device, count) do
+  #
+  # Two distinct shutdowns live here. Duration expiry is graceful: events
+  # generated before the cutoff are already ahead of the timer message in the
+  # mailbox, so they print before tracing is disabled and the loop keeps
+  # serving syncs until stopped. Limit and overload are immediate: tracing is
+  # disabled at the source and the process exits, discarding whatever queued
+  # past the point of usefulness — draining a flood of events that would
+  # never be printed only costs memory and shutdown latency.
+  defp tracer_loop(
+         %{id: id, pattern: pattern, limit: limit, device: device, overload: overload} = state,
+         count
+       ) do
     receive do
       {:beamdbg_sync, from, reference} ->
         send(from, {reference, :ok})
-        tracer_loop(pattern, limit, device, count)
+        tracer_loop(state, count)
 
       :beamdbg_stop ->
         :ok
+
+      {:beamdbg_window_elapsed, ^id} ->
+        if current_session_id() == id, do: disable_tracing(pattern)
+        IO.puts(device, "[BEAMDBG] trace window elapsed; tracing stopped")
+        spawn(fn -> stop_session(id) end)
+        tracer_loop(state, count)
 
       message when elem(message, 0) in [:trace_ts, :trace] ->
         new_count = count + 1
@@ -720,19 +870,33 @@ defmodule BeamDebug do
           IO.puts(device, "[BEAMDBG] " <> format_trace(message))
         end
 
-        if new_count == limit do
-          IO.puts(device, "[BEAMDBG] trace limit #{limit} reached; stopping tracing")
-          # Disable immediately to stop the flood, then release ownership from
-          # a separate process (stop_calls syncs with this loop, which keeps
-          # serving its mailbox until the stop message arrives).
-          disable_tracing(pattern)
-          spawn(fn -> stop_calls() end)
+        {:message_queue_len, queued} = Process.info(self(), :message_queue_len)
+
+        cond do
+          queued > overload ->
+            if current_session_id() == id, do: disable_tracing(pattern)
+
+            IO.puts(
+              device,
+              "[BEAMDBG] trace overloaded: #{queued} events queued (> #{overload}); " <>
+                "tracing aborted, queued events discarded — use a narrower target"
+            )
+
+            release_session(id)
+            :ok
+
+          new_count == limit ->
+            if current_session_id() == id, do: disable_tracing(pattern)
+            IO.puts(device, "[BEAMDBG] trace limit #{limit} reached; stopping tracing")
+            release_session(id)
+            :ok
+
+          true ->
+            tracer_loop(state, new_count)
         end
 
-        tracer_loop(pattern, limit, device, new_count)
-
       _other ->
-        tracer_loop(pattern, limit, device, count)
+        tracer_loop(state, count)
     end
   end
 
@@ -799,8 +963,18 @@ defmodule BeamDebug do
 
   defp split_arity(text) do
     case String.split(text, "/", parts: 2) do
-      [head, arity] -> {head, String.to_integer(arity)}
-      [head] -> {head, :_}
+      [head, arity] ->
+        case Integer.parse(arity) do
+          {value, ""} when value >= 0 ->
+            {head, value}
+
+          _ ->
+            raise ArgumentError,
+                  "arity must be a nonnegative integer, got: #{inspect(arity)}"
+        end
+
+      [head] ->
+        {head, :_}
     end
   end
 

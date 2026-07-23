@@ -384,6 +384,115 @@ if scenario helper-zero-match-clean; then
   fi
 fi
 
+if scenario helper-stale-timer-scoped; then
+  # 1 (v1.2.2 review): a duration timer from a stopped session must never
+  # stop a newer session. The old TargetA timer wakes at 300ms; the TargetB
+  # trace must still be live at 600ms.
+  run helper-stale-timer-scoped "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:ok, _} = BeamDebug.trace_calls({:lists, :reverse, 1}, for: 300, limit: 100)
+    BeamDebug.stop_calls()
+    {:ok, _} = BeamDebug.trace_calls({:lists, :seq, 2}, limit: 100)
+    Process.sleep(600)
+    :lists.seq(1, 3)
+    BeamDebug.flush_trace()
+    BeamDebug.stop_calls()
+    IO.puts("STALE-TIMER-DONE")
+  '
+  if expect_contains helper-stale-timer-scoped 'call :lists\.seq/2' &&
+     expect_contains helper-stale-timer-scoped 'STALE-TIMER-DONE'; then
+    pass helper-stale-timer-scoped
+  else
+    fail_scenario helper-stale-timer-scoped
+  fi
+fi
+
+if scenario helper-validates-arguments; then
+  # 4 (v1.2.2 review): trace_calls validates limit, duration and arity
+  # itself, and a rejected call leaves the VM fully traceable.
+  run helper-validates-arguments "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:error, {:invalid_limit, 0}} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: 0)
+    {:error, {:invalid_limit, :nan}} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: :nan)
+    {:error, {:invalid_duration, -5}} = BeamDebug.trace_calls({:lists, :reverse, 1}, for: -5)
+    {:error, {:invalid_target, _}} = BeamDebug.trace_calls({:lists, :reverse, -1})
+    {:error, {:invalid_target, _}} = BeamDebug.trace_calls("not a target")
+    {:ok, 1} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: 5)
+    BeamDebug.stop_calls()
+    IO.puts("VALIDATION-OK")
+  '
+  if expect_contains helper-validates-arguments 'VALIDATION-OK'; then
+    pass helper-validates-arguments
+  else
+    fail_scenario helper-validates-arguments
+  fi
+fi
+
+if scenario helper-foreign-pid-tracer; then
+  # 5 (v1.2.2 review): raw call tracing attached to one existing PID — not
+  # :dbg, not :new_processes — must be detected and refused, and the refusal
+  # must leave the foreign trace untouched. replace: true takes it over.
+  run helper-foreign-pid-tracer "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    foreign = spawn(fn -> Process.sleep(:infinity) end)
+    victim = spawn(fn -> Process.sleep(:infinity) end)
+    :erlang.trace(victim, true, [:call, {:tracer, foreign}])
+    {:error, :tracer_already_running} = BeamDebug.trace_calls({:lists, :reverse, 1})
+    {:tracer, ^foreign} = :erlang.trace_info(victim, :tracer)
+    IO.puts("FOREIGN-PID-REFUSED-UNTOUCHED")
+    {:ok, 1} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: 5, replace: true)
+    BeamDebug.stop_calls()
+    IO.puts("FOREIGN-PID-REPLACED")
+  '
+  if expect_contains helper-foreign-pid-tracer 'FOREIGN-PID-REFUSED-UNTOUCHED' &&
+     expect_contains helper-foreign-pid-tracer 'FOREIGN-PID-REPLACED'; then
+    pass helper-foreign-pid-tracer
+  else
+    fail_scenario helper-foreign-pid-tracer
+  fi
+fi
+
+if scenario helper-dbg-survives-shutdown; then
+  # 5 (v1.2.2 review): a :dbg session started while BeamDebug tracing is
+  # active must not be silently stopped by ordinary BeamDebug shutdown; only
+  # an explicit replace takeover may stop :dbg.
+  run helper-dbg-survives-shutdown "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:ok, _} = BeamDebug.trace_calls({:lists, :seq, 2}, limit: 5)
+    {:ok, _} = :dbg.tracer()
+    BeamDebug.stop_calls()
+    case Process.whereis(:dbg) do
+      pid when is_pid(pid) -> IO.puts("DBG-SURVIVES")
+      nil -> IO.puts("DBG-WAS-KILLED")
+    end
+    :dbg.stop()
+  '
+  if expect_contains helper-dbg-survives-shutdown 'DBG-SURVIVES' &&
+     expect_not_contains helper-dbg-survives-shutdown 'DBG-WAS-KILLED'; then
+    pass helper-dbg-survives-shutdown
+  else
+    fail_scenario helper-dbg-survives-shutdown
+  fi
+fi
+
+if scenario helper-overload-abort; then
+  # 2 (v1.2.2 review): when events queue faster than they print, the trace
+  # aborts with an explicit overload warning, discards the backlog, and
+  # releases ownership for the next trace.
+  run helper-overload-abort "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
+    {:ok, _} = BeamDebug.trace_calls({:lists, :reverse, 1}, limit: 1_000_000, overload_threshold: 50)
+    for _ <- 1..20_000, do: :lists.reverse([1, 2, 3])
+    Process.sleep(500)
+    case BeamDebug.trace_calls({:lists, :seq, 2}, limit: 5) do
+      {:ok, n} when n > 0 -> IO.puts("OVERLOAD-RELEASED")
+      other -> IO.puts("OVERLOAD-STUCK #{inspect(other)}")
+    end
+    BeamDebug.stop_calls()
+  '
+  if expect_contains helper-overload-abort 'trace overloaded' &&
+     expect_contains helper-overload-abort 'OVERLOAD-RELEASED'; then
+    pass helper-overload-abort
+  else
+    fail_scenario helper-overload-abort
+  fi
+fi
+
 if scenario helper-mailbox-not-copied; then
   # A2: a large mailbox must be reported by length, not materialized.
   run helper-mailbox-not-copied "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
@@ -749,6 +858,32 @@ if scenario snapshot-preserves-failure-status; then
   else
     printf '  expected nonzero status (status %s)\n' "$STATUS" >&2
     fail_scenario snapshot-preserves-failure-status
+  fi
+fi
+
+if scenario snapshot-compile-failure-status; then
+  # 3b: a compile failure under the snapshot wrapper must also exit nonzero.
+  printf 'defmodule Broken do\n' > "$PROJECT/lib/broken.ex"
+  run snapshot-compile-failure-status "$PROJECT" -- \
+    "$BEAM_DEBUG" snapshot --after 500 -- mix test test/fast_test.exs
+  rm -f "$PROJECT/lib/broken.ex"
+  if [[ "$STATUS" -ne 0 ]]; then
+    pass snapshot-compile-failure-status
+  else
+    printf '  expected nonzero status for a compile failure (status %s)\n' "$STATUS" >&2
+    fail_scenario snapshot-compile-failure-status
+  fi
+fi
+
+if scenario snapshot-invalid-task-status; then
+  # 3b: a nonexistent wrapped Mix task under snapshot must exit nonzero.
+  run snapshot-invalid-task-status "$PROJECT" -- \
+    "$BEAM_DEBUG" snapshot --after 500 -- mix nosuchtask
+  if [[ "$STATUS" -ne 0 ]]; then
+    pass snapshot-invalid-task-status
+  else
+    printf '  expected nonzero status for an unknown task (status %s)\n' "$STATUS" >&2
+    fail_scenario snapshot-invalid-task-status
   fi
 fi
 
