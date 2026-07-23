@@ -154,11 +154,20 @@ beam-debug trace :gen_server.call/3 --limit 20 -- mix test test/worker_test.exs:
            value: {:reply, 7, %{ticks: 7}}
 ```
 
-Installation is synchronous: the probe task compiles the project, verifies the
-target module is loaded and the pattern matched at least one function, and
-only then runs the wrapped command. A fast first call cannot slip past the
-tracer, and a target that never loads or matches nothing fails the run with an
-explicit diagnostic instead of producing silence.
+For modules compiled before the wrapped task, installation is synchronous: the
+probe task compiles the project, verifies the target module is loaded and the
+pattern matched at least one function, and only then runs the wrapped command
+— a fast first call cannot slip past the tracer. Modules that only come into
+existence while the wrapped task runs (defined in a test file, for example)
+get best-effort late-load attachment, announced up front. Either way, a target
+that never loads or matches nothing fails the run with an explicit diagnostic
+instead of producing silence, and wrapped-command exit statuses pass through
+untouched.
+
+The wrapped command is `mix test` or another Mix task that tolerates being
+precompiled first; an explicit `--no-compile` is respected. A tracer that
+existed before the probe is never replaced silently — pass `--replace-tracer`
+to take it over deliberately.
 
 Tracing is always bounded: it stops at exactly `--limit` events (default 200)
 and after `--for` milliseconds if given. Keep the target specific — a bare
@@ -199,13 +208,18 @@ their children — either protocol aimed at a process that does not implement it
 is slow, noisy, or crashes the callee. Everything else is observed through
 `Process.info/2` in two passes: a cheap node-wide ranking scan, then
 stacktraces only for the small selected groups — busiest mailboxes (`--top`),
-busiest by reductions, largest by memory, and a census of blocked application
-processes. The census exists because a deadlocked process usually has an
-*empty* mailbox: it lists waiting, empty-mailbox processes executing project
-code, grouped by identical stack, so the hung process appears even when
-nothing has a queue. Mailboxes longer than 100 messages are reported by length
-instead of sampled — `Process.info(pid, :messages)` copies the entire mailbox,
-which is exactly wrong for the mailbox-growth case.
+busiest by reductions, largest by memory, and a census of blocked processes in
+non-runtime code. The census exists because a deadlocked process usually has
+an *empty* mailbox: it lists waiting, empty-mailbox processes executing code
+outside the Erlang/Elixir installation (the project or its deps), grouped by
+identical stack, so the hung process appears even when nothing has a queue. It
+runs only on nodes with at most 400 processes and prints at most 20 stack
+groups, reporting what it omitted; on larger nodes pass `--names` with your
+suspects. A mailbox observed above 100 messages is reported by length instead
+of sampled — `Process.info(pid, :messages)` copies the entire mailbox, which
+is exactly wrong for the mailbox-growth case (the queue can still grow between
+the length check and a sample; nothing in `Process.info` is atomic across
+calls).
 
 Inside IEx the same observations are available directly:
 
@@ -248,14 +262,18 @@ suite and can hide the very interleaving that produces a race.
 test timeouts to `:infinity`, which is what makes `IEx.pry` usable during a test.
 
 For a flaky test, preserve the seed ExUnit printed for the failing run and
-reproduce with it before changing anything:
+reproduce with it — at the original scope — before changing anything:
 
 ```bash
-mix test --seed <failing seed> --repeat-until-failure 50 test/flaky_test.exs
+mix test --seed <failing seed>
+mix test --seed <failing seed> --repeat-until-failure 50
 ```
 
-Do not start from `--seed 0`; it disables order randomization and often erases
-the order dependency being investigated.
+Only after the failure reproduces under the original conditions, narrow one
+variable at a time; jumping straight to a single file can erase a failure that
+depends on suite order or another test's state. Do not start from `--seed 0`;
+it disables order randomization and often erases the order dependency being
+investigated.
 
 `beam-debug pry-test` needs a real terminal, so it is a human-assisted path
 rather than the principal escalation mechanism. `trace` and `snapshot` are
@@ -346,14 +364,20 @@ validation, journal round-tripping, idempotent install, hook JSON merging, and
 uninstall behavior in an isolated temporary home. It also asserts that
 `beam-debug test` never gains an implicit `--trace`.
 
-The integration suite generates a throwaway Mix project and drives `trace` and
+The integration suite generates throwaway Mix projects and drives `trace` and
 `snapshot` end to end through the real CLI: a fast first invocation is
 captured, clean compiles and recompiles keep the trace, absent targets fail
-loudly, `--limit` stops exactly at the limit, snapshotting an ordinary
-GenServer does not crash it, a huge mailbox is not copied, a zero-mailbox
-blocked process appears in hang diagnostics, and supervisor children come only
-from `--supervisors`. It runs on the locally installed toolchain (developed
-against Elixir 1.20 / OTP 28) and skips cleanly when elixir is unavailable.
+loudly, `--limit` stops exactly at the limit, reaching the limit releases
+ownership for the next trace, `--for` preserves pre-cutoff events, a
+test-file-defined module is traced via the late-load path, a pre-existing
+tracer is refused without `--replace-tracer` and taken over with it,
+`--no-compile` is respected, wrapped exit statuses (pass, test failure,
+compile failure, unknown task) pass through both wrappers, snapshotting an
+ordinary GenServer does not crash it, a huge mailbox is not copied, a
+zero-mailbox blocked process appears in hang diagnostics, and supervisor
+children come only from `--supervisors`. CI runs both suites across several
+OTP/Elixir combinations; locally they run on the installed toolchain and skip
+cleanly when elixir is unavailable.
 
 Two failure modes the implementation specifically engineers around, worth
 knowing if you modify it:

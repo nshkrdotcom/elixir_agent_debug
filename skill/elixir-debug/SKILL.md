@@ -40,8 +40,11 @@ spans several processes, or the evidence keeps contradicting the current
 story — go wide deliberately: enumerate every plausible cause you can defend,
 including interactions between them, and design observation runs that
 discriminate among many candidates at once. The point of the wide phase is
-grounding: do not settle on a root cause until direct evidence supports it,
-rather than only the elimination of the alternatives you happened to list.
+grounding: do not settle on a root cause until the strongest available causal
+evidence supports it — a direct observation when one is obtainable;
+converging observations, controlled perturbations and a regression test when
+it is not. Elimination of the alternatives you happened to list is not, by
+itself, grounding.
 
 What "change deliberately" means for edits:
 
@@ -55,10 +58,11 @@ What "change deliberately" means for edits:
 Keep every verification cycle causally interpretable: after the run, you must
 be able to say which change produced which change in behaviour.
 
-Keep the reproducer narrow — one test file, one line, one process, one message
-path — but keep the *observation* wide. Narrowing the reproducer is cheap;
-narrowing what you look at during the run is how theories survive that should
-have died.
+Keep the reproducer as narrow as possible *without changing the conditions
+required to reproduce the failure* — shrinking a concurrency failure to one
+file or one process can remove the bug — and keep the *observation* wide.
+Narrowing the reproducer is cheap; narrowing what you look at during the run
+is how theories survive that should have died.
 
 ## Start from the symptom
 
@@ -97,12 +101,20 @@ beam-debug trace MyApp.Worker --limit 50 --for 2000 -- mix test test/worker_test
 `trace` installs a bounded call trace from a probe outside the repository and
 reports arguments, return values and exceptions, for local as well as exported
 functions, including code you cannot edit. Erlang modules use the `:mod`,
-`:mod.fun`, `:mod.fun/arity` form. Installation is synchronous — the project
-is compiled and the pattern verified before the wrapped command starts, so a
-fast first call cannot be missed, and a target that never loads or matches
-nothing fails the run with an explicit diagnostic instead of printing nothing.
-It stops at exactly `--limit` events (default 200) and after `--for`
-milliseconds if given.
+`:mod.fun`, `:mod.fun/arity` form. For modules compiled before the wrapped
+task, installation is synchronous — compile, verify the module is loaded and
+the pattern matched, only then run the command — so a fast first call cannot
+be missed. Modules that only come into existence while the wrapped task runs
+(for example, defined inside a test file) get best-effort late-load
+attachment, announced up front; either way a target that never loads or
+matches nothing fails the run with an explicit diagnostic instead of printing
+nothing. Tracing stops at exactly `--limit` events (default 200) and after
+`--for` milliseconds if given.
+
+The wrapped command is `mix test` or another Mix task that tolerates being
+precompiled first; an explicit `--no-compile` in the wrapped command is
+respected. A tracer that existed before the probe is never replaced silently —
+the run fails unless you pass `--replace-tracer`.
 
 Its cost is real: keep the target specific. `Mod` with no function traces every
 function in the module and will flood a busy run. Prefer `Mod.fun/arity`.
@@ -123,15 +135,21 @@ nothing left to inspect.
 The report contains: full snapshots of the `--names` targets (state, mailbox
 sample, stacktrace, links, monitors), children of the `--supervisors` targets,
 the busiest mailboxes, the busiest processes by reductions, the largest by
-memory, and a census of blocked application processes — waiting, empty
-mailbox, executing project code — because a deadlocked process usually has an
-*empty* mailbox and would be invisible in a mailbox ranking.
+memory, and a census of blocked processes in non-runtime code — waiting,
+empty mailbox, executing anything outside the Erlang/Elixir installation
+(project or deps) — because a deadlocked process usually has an *empty*
+mailbox and would be invisible in a mailbox ranking. The census runs only on
+nodes with at most 400 processes (a large Phoenix or distributed node can
+exceed that, at which point pass `--names` with your suspects) and prints at
+most 20 stack groups, reporting how many it omitted.
 
 Only `--names` targets receive `:sys` system messages and only
 `--supervisors` targets are asked for children: either protocol aimed at a
 process that does not implement it is slow, noisy, or crashes the callee.
-Mailboxes longer than 100 messages are reported by length instead of sampled,
-because `Process.info(pid, :messages)` copies the entire mailbox.
+A mailbox observed above 100 messages is reported by length instead of
+sampled, because `Process.info(pid, :messages)` copies the entire mailbox
+(the queue can still grow between the length check and a sample — nothing in
+`Process.info` is atomic across calls).
 
 Inside an IEx session the same observations are available directly:
 
@@ -178,9 +196,15 @@ Do not pipe an interactive pry session through capture.
 Reproduce reliably *before* forming a fix. The order matters:
 
 1. Capture the seed ExUnit printed for the failing run.
-2. Re-run with exactly that seed: `mix test --seed <seed> <file>`.
-3. Confirm it is reproducible: `mix test --seed <seed> --repeat-until-failure 50`.
-4. Only then narrow.
+2. Re-run the **exact original command and scope** with that seed — same
+   files, tags, env and concurrency: `mix test --seed <seed>`. Selecting a
+   single file is already narrowing, and can erase a failure that depends on
+   another test file, suite order, shared database state or concurrent async
+   cases.
+3. Confirm it reproduces under those same conditions:
+   `mix test --seed <seed> --repeat-until-failure 50`.
+4. Only then reduce — files, tags, processes, concurrency — one variable at a
+   time, re-checking that the failure survives each reduction.
 
 Do not start with `--seed 0`. It disables order randomization and will often
 erase the very order dependency being investigated.
@@ -192,8 +216,10 @@ reason; `--trace` appears only in `beam-debug pry-test`, where disabling test
 timeouts is the point.
 
 Comparing normal concurrency against controlled serialization is a legitimate
-*experiment* — a failure that survives `--max-cases 1` is not an interleaving
-bug. Just do not make serialization the default.
+*experiment*, but read it precisely: a failure that disappears under
+`--max-cases 1` implicates cross-test concurrency; a failure that survives it
+may still be an interleaving bug *inside* one test or among application
+processes — serialization only removes concurrency between ExUnit cases.
 
 ## Interactive escalation
 

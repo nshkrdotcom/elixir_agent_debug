@@ -34,6 +34,20 @@ Verified 2026-07-19 against current official documentation.
   https://hexdocs.pm/mix/Mix.Tasks.Xref.html
 - `Macro.expand_once/2` and `Macro.to_string/1`:
   https://hexdocs.pm/elixir/Macro.html
+- `:erlang.trace/3`, `:erlang.trace_pattern/3`, `:erlang.trace_delivered/1`
+  (the raw BIFs `trace_calls/2` is built on; `:dbg` is deliberately not used —
+  see README "Verify the installation"):
+  https://www.erlang.org/doc/apps/erts/erlang.html#trace/3
+- Match specifications for trace patterns:
+  https://www.erlang.org/doc/apps/erts/match_spec.html
+- `Process.info/2` (census, mailbox length, stacktraces):
+  https://hexdocs.pm/elixir/Process.html#info/2
+- `Supervisor.which_children/1` (explicit `--supervisors` queries only —
+  crashes non-supervisor callees):
+  https://hexdocs.pm/elixir/Supervisor.html#which_children/1
+- Custom Mix tasks (`Mix.Task` behaviour; the probes are `-r`-loaded tasks
+  that wrap the requested task):
+  https://hexdocs.pm/mix/Mix.Task.html
 
 ## Scope decision
 
