@@ -19,7 +19,10 @@ The rule it encodes is **explore broadly, observe efficiently, change
 deliberately**:
 
 - Match diagnostic breadth to uncertainty: rank several plausible causes when
-  the failure is ambiguous, skip the ritual when it is already localized.
+  the failure is ambiguous, skip the ritual when it is already localized, and
+  escalate to a deliberately wide sweep — many defensible hypotheses, one
+  observation run that discriminates among them — when the failure is
+  genuinely gnarly and grounding on the real cause is the hard part.
 - Batch observations when they are independent, bounded and unlikely to
   perturb the behavior being measured — and account for the fact that tracing
   and profiling are not free just because they are read-only.

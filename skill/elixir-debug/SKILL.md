@@ -34,6 +34,15 @@ causes; a failure that is already localized deserves a fix, not a ritual.
 5. Converge on a sufficiently supported causal explanation — which may involve
    multiple interacting causes, not always a single root cause.
 
+Breadth is an escalation tool, not a standing policy. When a failure is
+genuinely gnarly — it survived a plausible fix, reproduces only sometimes,
+spans several processes, or the evidence keeps contradicting the current
+story — go wide deliberately: enumerate every plausible cause you can defend,
+including interactions between them, and design observation runs that
+discriminate among many candidates at once. The point of the wide phase is
+grounding: do not settle on a root cause until direct evidence supports it,
+rather than only the elimination of the alternatives you happened to list.
+
 What "change deliberately" means for edits:
 
 - an unsupported production fix: avoid;
