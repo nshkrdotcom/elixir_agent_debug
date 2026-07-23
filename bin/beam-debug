@@ -5,9 +5,11 @@ SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
 GUARD="$ROOT/hooks/stop_guard.py"
 JOURNAL="$ROOT/lib/journal.py"
+MANAGER="$ROOT/lib/manage_install.py"
 HELPER="$ROOT/support/beam_debug.exs"
 PROBE_TRACE="$ROOT/support/probe_trace.exs"
 PROBE_SNAPSHOT="$ROOT/support/probe_snapshot.exs"
+PACKAGE_VERSION="$(cat -- "$ROOT/VERSION" 2>/dev/null || printf '0.0.0')"
 
 usage() {
   cat <<'USAGE'
@@ -66,7 +68,14 @@ Evidence journal (optional, per repository):
   report                      Summarize journal hypotheses by status
 
 Other:
-  doctor                      Check the local install and BEAM toolchain
+  doctor                      Check the local install, BEAM toolchain, and
+                              this project's minimum-version requirement
+  init-project                Mark this repository as using elixir-agent-debug:
+                              writes .beam-debug.toml (a minimum-version
+                              floor) and short pointer notes into the project
+                              CLAUDE.md and AGENTS.md. Adds no project-local
+                              hooks, skills, or executables — those stay
+                              user-level by design.
   iex [mix-args...]           Run `iex -S mix ...` with helpers preloaded
   capture -- <command...>     Run inline and tee output to a per-repo latest.log
   latest                      Print the latest captured log for this repo
@@ -98,9 +107,75 @@ need() {
   fi
 }
 
+# --- per-project manifest (.beam-debug.toml) ---------------------------------
+# A checked-in floor, not a vendored install: the executable, skill and hook
+# always come from the user-level installation. The manifest only states the
+# minimum version this project expects.
+
+project_manifest() {
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ -f "$root/.beam-debug.toml" ]] || return 1
+  printf '%s/.beam-debug.toml\n' "$root"
+}
+
+# manifest_value <file> <key> — tolerant `key = "value"` reader
+manifest_value() {
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*[\"']\{0,1\}\([^\"'#]*\)[\"']\{0,1\}.*/\1/p" "$1" \
+    | head -1 | tr -d '[:space:]'
+}
+
+# floor_satisfied <minimum> — true when PACKAGE_VERSION >= minimum
+floor_satisfied() {
+  [[ "$(printf '%s\n%s\n' "$1" "$PACKAGE_VERSION" | sort -V | head -1)" == "$1" ]]
+}
+
+require_project_floor() {
+  local manifest minimum
+  manifest="$(project_manifest)" || return 0
+  [[ "$(manifest_value "$manifest" enabled)" == "true" ]] || return 0
+  minimum="$(manifest_value "$manifest" minimum_version)"
+  [[ -n "$minimum" ]] || return 0
+  if ! floor_satisfied "$minimum"; then
+    printf 'beam-debug: this project requires elixir-agent-debug >= %s; installed is %s.\n' \
+      "$minimum" "$PACKAGE_VERSION" >&2
+    printf 'Upgrade the user-level install: pull the latest elixir-agent-debug and rerun ./install.sh\n' >&2
+    printf '(https://github.com/nshkrdotcom/elixir_agent_debug — see %s)\n' "$manifest" >&2
+    exit 3
+  fi
+}
+
+init_project() {
+  need git
+  need python3
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    printf 'beam-debug init-project: not inside a git worktree.\n' >&2
+    exit 2
+  }
+
+  local manifest="$root/.beam-debug.toml"
+  if [[ -f "$manifest" ]]; then
+    printf 'Manifest already present: %s (minimum_version %s)\n' \
+      "$manifest" "$(manifest_value "$manifest" minimum_version)"
+  else
+    printf 'enabled = true\nminimum_version = "%s"\n' "$PACKAGE_VERSION" > "$manifest"
+    printf 'Wrote %s (minimum_version = "%s")\n' "$manifest" "$PACKAGE_VERSION"
+  fi
+
+  python3 "$MANAGER" block-add "$root/CLAUDE.md" "$ROOT/adapters/project-instructions.md"
+  python3 "$MANAGER" block-add "$root/AGENTS.md" "$ROOT/adapters/project-instructions.md"
+  printf 'Added the project note to %s and %s (idempotent; safe to rerun).\n' \
+    "$root/CLAUDE.md" "$root/AGENTS.md"
+  printf 'Commit .beam-debug.toml, CLAUDE.md and AGENTS.md to share this with the team.\n'
+  printf 'Nothing project-local was installed: the executable, skill and optional\n'
+  printf 'Stop hook stay user-level (see README: Per-project setup).\n'
+}
+
 doctor() {
   local failed=0
   printf 'elixir-agent-debug root: %s\n' "$ROOT"
+  printf 'version: %s\n' "$PACKAGE_VERSION"
 
   for command in bash python3 git sha256sum; do
     if command -v "$command" >/dev/null 2>&1; then
@@ -124,6 +199,24 @@ doctor() {
     printf 'ok: git repo   %s\n' "$(git rev-parse --show-toplevel)"
   else
     printf 'note: current directory is not inside a git worktree; marker scanning is inactive here.\n'
+  fi
+
+  local manifest minimum
+  if manifest="$(project_manifest)"; then
+    minimum="$(manifest_value "$manifest" minimum_version)"
+    if [[ "$(manifest_value "$manifest" enabled)" != "true" ]]; then
+      printf 'note: project manifest present but disabled: %s\n' "$manifest"
+    elif [[ -z "$minimum" ]]; then
+      printf 'note: project manifest has no minimum_version: %s\n' "$manifest"
+    elif floor_satisfied "$minimum"; then
+      printf 'ok: project floor %s (installed %s)\n' "$minimum" "$PACKAGE_VERSION"
+    else
+      printf 'FAIL: this project requires >= %s but %s is installed; pull the latest and rerun ./install.sh\n' \
+        "$minimum" "$PACKAGE_VERSION"
+      failed=1
+    fi
+  else
+    printf 'note: no project manifest; `beam-debug init-project` records a version floor for a team.\n'
   fi
 
   printf 'claude skill: %s\n' "$HOME/.claude/skills/elixir-debug/SKILL.md"
@@ -263,9 +356,19 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
+# The floor check protects real work; help, doctor and init-project must stay
+# reachable on any version so the situation can be diagnosed and fixed.
+case "$command" in
+  help|-h|--help|doctor|init-project) : ;;
+  *) require_project_floor ;;
+esac
+
 case "$command" in
   doctor)
     doctor
+    ;;
+  init-project)
+    init_project
     ;;
   test)
     need mix

@@ -330,6 +330,38 @@ set -e
   "$HOME/.local/bin/beam-debug" latest | grep -q 'captured-output'
 ) || fail 'captured log was not retrievable'
 
+printf 'Checking per-project manifest and version floor...\n'
+(
+  cd "$repo"
+  "$HOME/.local/bin/beam-debug" init-project >/dev/null
+  "$HOME/.local/bin/beam-debug" init-project >/dev/null
+) || fail 'init-project failed'
+[[ -f "$repo/.beam-debug.toml" ]] || fail 'init-project did not write the manifest'
+grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" \
+  || fail 'manifest minimum_version does not match the installed version'
+[[ "$(grep -c 'elixir-agent-debug:begin' "$repo/CLAUDE.md")" -eq 1 ]] \
+  || fail 'project CLAUDE.md block missing or duplicated'
+[[ "$(grep -c 'elixir-agent-debug:begin' "$repo/AGENTS.md")" -eq 1 ]] \
+  || fail 'project AGENTS.md block missing or duplicated'
+
+printf 'enabled = true\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
+set +e
+(cd "$repo" && "$HOME/.local/bin/beam-debug" scan) >/dev/null 2>&1
+floor_status=$?
+set -e
+[[ "$floor_status" -eq 3 ]] || fail "an unmet version floor should exit 3 (got $floor_status)"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" help >/dev/null) \
+  || fail 'help must stay reachable under an unmet floor'
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
+  fail 'doctor should exit nonzero under an unmet floor'
+fi
+printf 'enabled = false\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
+  || fail 'enabled = false must disable the floor check'
+printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
+  || fail 'a satisfied floor must not block commands'
+
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh"
 
 [[ ! -e "$HOME/.local/bin/beam-debug" ]] || fail 'beam-debug symlink remained'

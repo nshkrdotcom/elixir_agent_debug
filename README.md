@@ -116,6 +116,64 @@ session is the least surprising verification path.
 For Codex hooks, open `/hooks` once and trust the installed hook definition.
 Codex intentionally requires review of non-managed command hooks.
 
+## Per-project setup (optional, for teams)
+
+Everything privileged — the `beam-debug` executable, the helper and probes,
+the `elixir-debug` skill, and the optional Stop hook — is installed **per
+user**, on purpose. What a repository can check in is the *requirement* to
+use it:
+
+```bash
+cd your-project
+beam-debug init-project
+git add .beam-debug.toml CLAUDE.md AGENTS.md
+```
+
+`init-project` writes exactly two things, both safe to commit and both
+idempotent:
+
+- **`.beam-debug.toml`** — a tiny manifest recording the minimum
+  elixir-agent-debug version the project expects:
+
+  ```toml
+  enabled = true
+  minimum_version = "1.4.0"
+  ```
+
+- **A short managed block** in the project's `CLAUDE.md` and `AGENTS.md`,
+  telling agents (and teammates) that this project uses the user-installed
+  skill and command, how to install it if missing, and to run
+  `beam-debug doctor` before debugging.
+
+Version skew then resolves one way, deliberately:
+
+- installed version ≥ the floor → everything works normally, newer is fine;
+- installed version < the floor → `beam-debug` commands fail up front with a
+  clear upgrade message (and `doctor` reports it), instead of running with
+  behavior older than the project expects;
+- `beam-debug` not installed at all → the checked-in block tells the reader
+  how to install it;
+- want the check gone temporarily → set `enabled = false` in the manifest,
+  or delete the file.
+
+Raise `minimum_version` by editing the manifest and committing, like any
+other project requirement.
+
+What `init-project` deliberately does **not** do: install project-local
+skills, hooks, or executables. Project and user hooks *merge* in Claude Code
+— both would fire, so a checked-in hook would double every stop check for
+anyone with the global install. A personal skill overrides a same-named
+project skill anyway, so a vendored skill could not reliably win — but a
+stale one could still confuse matters. And a repository-vendored executable
+would mean cloned code runs automatically on your machine, which is exactly
+the kind of trust decision that should stay explicit and user-level. If a
+genuine version-pinning need emerges someday, the right vehicle is a
+versioned plugin with a namespaced skill, not vendoring.
+
+Uninstalling the user-level package never touches project files — the
+manifest and instruction blocks belong to the repository, and removing them
+is an ordinary commit.
+
 ## Use
 
 Usually, just ask the agent to debug. The global instruction tells it to load
@@ -132,6 +190,7 @@ Useful commands:
 
 ```bash
 beam-debug doctor
+beam-debug init-project
 beam-debug test test/path_test.exs:42
 beam-debug trace MyApp.Worker.handle_call/3 -- mix test test/path_test.exs:42
 beam-debug snapshot --after 5000 --names MyApp.Worker -- mix test test/slow_test.exs
