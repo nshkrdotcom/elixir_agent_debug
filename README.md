@@ -85,8 +85,9 @@ cd elixir-agent-debug
 ```
 
 The default install is instructions and tools only; it never edits either
-client's hook configuration. Cleanup checking is explicit: the agent (or you)
-runs `beam-debug assert-clean`.
+client's hook configuration. Cleanup is explicit through the agent-owned
+`beam-debug begin` / `beam-debug end` cycle; `beam-debug assert-clean` is
+the whole-worktree audit, for when you ask for one.
 
 `--hooks` opts in to the automatic Stop-hook check. It is deliberately not
 the default: a Stop hook runs at the end of *every* session in every
