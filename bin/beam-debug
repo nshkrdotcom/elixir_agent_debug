@@ -130,11 +130,37 @@ floor_satisfied() {
   [[ "$(printf '%s\n%s\n' "$1" "$PACKAGE_VERSION" | sort -V | head -1)" == "$1" ]]
 }
 
+# manifest_floor <file> — prints the required minimum version; prints nothing
+# when the check is disabled. A requirement manifest fails closed: anything
+# other than enabled = true|false, or a non-version minimum, is an error.
+manifest_floor() {
+  local file="$1" enabled minimum
+  enabled="$(manifest_value "$file" enabled)"
+  case "$enabled" in
+    false)
+      return 0
+      ;;
+    true)
+      ;;
+    *)
+      printf 'beam-debug: malformed %s: `enabled` must be true or false (got: %s)\n' \
+        "$file" "${enabled:-<missing>}" >&2
+      return 3
+      ;;
+  esac
+  minimum="$(manifest_value "$file" minimum_version)"
+  if ! [[ "$minimum" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    printf 'beam-debug: malformed %s: `minimum_version` must be a plain version like "1.4.0" (got: %s)\n' \
+      "$file" "${minimum:-<missing>}" >&2
+    return 3
+  fi
+  printf '%s\n' "$minimum"
+}
+
 require_project_floor() {
   local manifest minimum
   manifest="$(project_manifest)" || return 0
-  [[ "$(manifest_value "$manifest" enabled)" == "true" ]] || return 0
-  minimum="$(manifest_value "$manifest" minimum_version)"
+  minimum="$(manifest_floor "$manifest")" || exit 3
   [[ -n "$minimum" ]] || return 0
   if ! floor_satisfied "$minimum"; then
     printf 'beam-debug: this project requires elixir-agent-debug >= %s; installed is %s.\n' \
@@ -156,8 +182,19 @@ init_project() {
 
   local manifest="$root/.beam-debug.toml"
   if [[ -f "$manifest" ]]; then
+    # Refreshing the notes with an older template would silently downgrade
+    # the project guidance: initialize-only when the floor is not met.
+    local minimum
+    minimum="$(manifest_floor "$manifest")" || exit 3
+    if [[ -n "$minimum" ]] && ! floor_satisfied "$minimum"; then
+      printf 'beam-debug init-project: this project already requires >= %s; installed is %s.\n' \
+        "$minimum" "$PACKAGE_VERSION" >&2
+      printf 'Refusing to rewrite the project notes with an older template. Upgrade first:\n' >&2
+      printf 'pull the latest elixir-agent-debug and rerun ./install.sh\n' >&2
+      exit 3
+    fi
     printf 'Manifest already present: %s (minimum_version %s)\n' \
-      "$manifest" "$(manifest_value "$manifest" minimum_version)"
+      "$manifest" "${minimum:-disabled}"
   else
     printf 'enabled = true\nminimum_version = "%s"\n' "$PACKAGE_VERSION" > "$manifest"
     printf 'Wrote %s (minimum_version = "%s")\n' "$manifest" "$PACKAGE_VERSION"
@@ -201,13 +238,20 @@ doctor() {
     printf 'note: current directory is not inside a git worktree; marker scanning is inactive here.\n'
   fi
 
-  local manifest minimum
+  local manifest minimum enabled
   if manifest="$(project_manifest)"; then
+    enabled="$(manifest_value "$manifest" enabled)"
     minimum="$(manifest_value "$manifest" minimum_version)"
-    if [[ "$(manifest_value "$manifest" enabled)" != "true" ]]; then
+    if [[ "$enabled" == "false" ]]; then
       printf 'note: project manifest present but disabled: %s\n' "$manifest"
-    elif [[ -z "$minimum" ]]; then
-      printf 'note: project manifest has no minimum_version: %s\n' "$manifest"
+    elif [[ "$enabled" != "true" ]]; then
+      printf 'FAIL: malformed %s: `enabled` must be true or false (got: %s)\n' \
+        "$manifest" "${enabled:-<missing>}"
+      failed=1
+    elif ! [[ "$minimum" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+      printf 'FAIL: malformed %s: `minimum_version` must be a plain version like "1.4.0" (got: %s)\n' \
+        "$manifest" "${minimum:-<missing>}"
+      failed=1
     elif floor_satisfied "$minimum"; then
       printf 'ok: project floor %s (installed %s)\n' "$minimum" "$PACKAGE_VERSION"
     else
@@ -356,10 +400,12 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
-# The floor check protects real work; help, doctor and init-project must stay
-# reachable on any version so the situation can be diagnosed and fixed.
+# The floor check protects real work, never recovery: help/doctor diagnose
+# the situation, and end/scan/assert-clean/latest let an under-versioned
+# install still clean up its own markers and read what it already captured.
+# init-project performs its own check so it can refuse a downgrade precisely.
 case "$command" in
-  help|-h|--help|doctor|init-project) : ;;
+  help|-h|--help|doctor|init-project|end|scan|assert-clean|latest) : ;;
   *) require_project_floor ;;
 esac
 

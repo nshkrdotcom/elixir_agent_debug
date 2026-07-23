@@ -150,11 +150,23 @@ Version skew then resolves one way, deliberately:
 - installed version ≥ the floor → everything works normally, newer is fine;
 - installed version < the floor → `beam-debug` commands fail up front with a
   clear upgrade message (and `doctor` reports it), instead of running with
-  behavior older than the project expects;
+  behavior older than the project expects. Recovery commands stay available:
+  `end`, `scan`, `assert-clean` and `latest` are exempt, so an
+  under-versioned install can always clean up its own markers, and
+  `init-project` refuses to touch an already-initialized project whose floor
+  it does not meet (it would rewrite the notes with an older template);
+- installed version predates 1.4.0 → the binary does not know about
+  `.beam-debug.toml` at all and ignores it. The floor mechanism cannot reach
+  backwards, so the checked-in project note carries the bootstrap check
+  instead: it instructs agents not to proceed unless `beam-debug doctor`
+  prints both a `version:` line and an `ok: project floor ...` result —
+  output a pre-1.4.0 `doctor` cannot produce;
 - `beam-debug` not installed at all → the checked-in block tells the reader
   how to install it;
 - want the check gone temporarily → set `enabled = false` in the manifest,
-  or delete the file.
+  or delete the file. Anything else fails closed: a requirement manifest
+  with a malformed `enabled` or `minimum_version` is an error, not a silent
+  no-op.
 
 Raise `minimum_version` by editing the manifest and committing, like any
 other project requirement.

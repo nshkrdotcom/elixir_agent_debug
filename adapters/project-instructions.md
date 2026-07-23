@@ -9,10 +9,13 @@ git clone https://github.com/nshkrdotcom/elixir_agent_debug
 cd elixir_agent_debug && ./install.sh
 ```
 
-Run `beam-debug doctor` before debugging: it checks the BEAM toolchain and
-this project's minimum version, recorded in `.beam-debug.toml`. If it reports
-the installed version is too old, upgrade the user-level install (pull the
-latest and rerun `./install.sh`).
+Run `beam-debug doctor` before debugging and check its output. Do not
+proceed unless it prints **both** a package `version:` line and an
+`ok: project floor ...` result. A too-old floor result means upgrade the
+user-level install (pull the latest and rerun `./install.sh`). If either
+line is *absent entirely*, the installation predates project-floor support
+(pre-1.4.0) and silently ignores `.beam-debug.toml` — it must be upgraded
+the same way before debugging here.
 
 Do not vendor or install project-local hooks, skills, or executables for this
 package. The executable, skill and optional Stop hook are user-level by

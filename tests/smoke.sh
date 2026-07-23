@@ -346,7 +346,7 @@ grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" 
 
 printf 'enabled = true\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
 set +e
-(cd "$repo" && "$HOME/.local/bin/beam-debug" scan) >/dev/null 2>&1
+(cd "$repo" && "$HOME/.local/bin/beam-debug" history) >/dev/null 2>&1
 floor_status=$?
 set -e
 [[ "$floor_status" -eq 3 ]] || fail "an unmet version floor should exit 3 (got $floor_status)"
@@ -355,11 +355,34 @@ set -e
 if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
   fail 'doctor should exit nonzero under an unmet floor'
 fi
-printf 'enabled = false\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
+# Recovery commands must never be locked out by the floor.
 (cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
+  || fail 'scan must stay reachable under an unmet floor'
+(cd "$repo" && "$HOME/.local/bin/beam-debug" assert-clean >/dev/null) \
+  || fail 'assert-clean must stay reachable under an unmet floor'
+(cd "$repo" && XDG_STATE_HOME="$state" "$HOME/.local/bin/beam-debug" end >/dev/null) \
+  || fail 'end must stay reachable under an unmet floor'
+# init-project must refuse to rewrite the notes of a project it is too old for.
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
+  fail 'init-project rewrote a project whose floor it does not meet'
+fi
+# A requirement manifest fails closed, never silently off.
+printf 'enabled = maybe\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
+  fail 'a malformed enabled value must be an error'
+fi
+printf 'enabled = true\nminimum_version = "banana"\n' > "$repo/.beam-debug.toml"
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
+  fail 'a malformed minimum_version must be an error'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor >/dev/null 2>&1); then
+  fail 'doctor should exit nonzero on a malformed manifest'
+fi
+printf 'enabled = false\nminimum_version = "99.0.0"\n' > "$repo/.beam-debug.toml"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
   || fail 'enabled = false must disable the floor check'
 printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
-(cd "$repo" && "$HOME/.local/bin/beam-debug" scan >/dev/null) \
+(cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
   || fail 'a satisfied floor must not block commands'
 
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh"
