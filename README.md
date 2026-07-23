@@ -15,24 +15,23 @@ A deliberately small, user-level debugging layer for **Claude Code CLI** and
 It gives both agents the same evidence-first Elixir/OTP workflow without an MCP
 server, daemon, custom agent tree, or required Hex dependency.
 
-The rule it enforces is **generate broadly, test efficiently, edit cautiously**:
+The rule it encodes is **explore broadly, observe efficiently, change
+deliberately**:
 
-1. Form a *ranked set* of hypotheses, not one. Committing to the first plausible
-   story is the most common way a debugging session goes wrong.
-2. Pick the evidence that *discriminates* between them.
-3. Collect it in as few runs as possible — batch independent read-only checks
-   instead of serializing them one theory at a time.
-4. Let the observed values do the eliminating, including values that contradict
-   the favoured theory. Record what died in the per-repository journal.
-5. Only then edit, and never combine unrelated speculative fixes in one patch.
+- Match diagnostic breadth to uncertainty: rank several plausible causes when
+  the failure is ambiguous, skip the ritual when it is already localized.
+- Batch observations when they are independent, bounded and unlikely to
+  perturb the behavior being measured — and account for the fact that tracing
+  and profiling are not free just because they are read-only.
+- For edits: an unsupported production fix is avoided; a small, reversible,
+  clearly labeled diagnostic experiment is allowed; an evidence-supported
+  correction proceeds; several unrelated guessed fixes in one patch — never.
 
-The discipline binds **mutation**, not diagnostic breadth. Many hypotheses at
-once is good; many read-only observations at once is good; many probes in one
-run is usually good. Several unrelated guessed fixes in one patch is not.
-
-Routing starts from the **symptom** — deterministic failure, flaky, hangs,
-crashes and restarts, wrong state, mailbox growth, slow, memory growth,
-regression, structural, macro — not from a fixed tool order.
+The discipline binds **mutation**, not diagnostic breadth. Symptom guidance —
+deterministic failure, flaky, hangs, crashes and restarts, wrong state,
+mailbox growth, slow, memory growth, regression, structural, macro — is
+advisory: the agent picks the cheapest discriminating evidence, not a fixed
+tool order.
 
 ## What gets installed
 
@@ -134,30 +133,40 @@ beam-debug assert-clean
 
 ### Observe without editing the repository
 
-`beam-debug trace` installs a bounded `:dbg` call trace from a probe file that
-lives outside your project. It reports arguments, return values and exceptions
-for local as well as exported functions — including code you cannot edit — and
+`beam-debug trace` installs a bounded call trace from a probe that lives
+outside your project. It reports arguments, return values and exceptions for
+local as well as exported functions — including code you cannot edit — and
 nothing needs cleaning up afterwards:
 
 ```bash
 beam-debug trace MyApp.Worker.handle_call/3 -- mix test test/worker_test.exs:42
+beam-debug trace :gen_server.call/3 --limit 20 -- mix test test/worker_test.exs:42
 ```
 
 ```text
-[BEAMDBG] tracing MyApp.Worker.handle_call/3 limit=200 for=0ms matched={:ok, [{:matched, :nonode@nohost, 1}]}
+[BEAMDBG] tracing MyApp.Worker.handle_call/3 limit=200 for=0ms matched=1
 [BEAMDBG] 16:26:22 #PID<0.144.0> call MyApp.Worker.handle_call/3
            args: [{:bump, 7}, {#PID<0.104.0>, [...]}, %{ticks: 0}]
 [BEAMDBG] 16:26:22 #PID<0.144.0> return MyApp.Worker.handle_call/3
            value: {:reply, 7, %{ticks: 7}}
 ```
 
-Tracing is always bounded: it stops after `--limit` events (default 200) and
-after `--for` milliseconds if given. Keep the target specific — a bare `Mod`
-traces every function in the module and will flood a busy run.
+Installation is synchronous: the probe task compiles the project, verifies the
+target module is loaded and the pattern matched at least one function, and
+only then runs the wrapped command. A fast first call cannot slip past the
+tracer, and a target that never loads or matches nothing fails the run with an
+explicit diagnostic instead of producing silence.
 
-`beam-debug snapshot` runs a command with a watchdog that fires at a wall-clock
-time you choose, while the system is still running, and dumps state, mailbox
-sample, current stacktrace, links, monitors and supervisor children:
+Tracing is always bounded: it stops at exactly `--limit` events (default 200)
+and after `--for` milliseconds if given. Keep the target specific — a bare
+`Mod` traces every function in the module and will flood a busy run. Erlang
+modules use the `:mod`, `:mod.fun`, `:mod.fun/arity` form.
+
+`beam-debug snapshot` runs a command with a watchdog that fires at a
+wall-clock time you choose — measured from the start of the wrapped task,
+after compilation — while the system is still running, and dumps state,
+mailbox sample, current stacktrace, links and monitors for the processes you
+name:
 
 ```bash
 beam-debug snapshot --after 2500 --names MyApp.Worker -- mix test test/hang_test.exs
@@ -179,17 +188,30 @@ That output is the whole point: the stacktrace names the blocking line, and the
 
 Timing is explicit because ExUnit tears down supervised processes as soon as a
 test finishes, so anything that captures *after* the failure finds nothing left
-to inspect. Process discovery is explicit for the same reason: only the names
-you pass get system-message probes, while `--top` reports cheap `Process.info`
-for the busiest mailboxes.
+to inspect.
+
+Process discovery is explicit for the same reason: only `--names` targets
+receive `:sys` system messages, and only `--supervisors` targets are asked for
+their children — either protocol aimed at a process that does not implement it
+is slow, noisy, or crashes the callee. Everything else is observed through
+`Process.info/2` in two passes: a cheap node-wide ranking scan, then
+stacktraces only for the small selected groups — busiest mailboxes (`--top`),
+busiest by reductions, largest by memory, and a census of blocked application
+processes. The census exists because a deadlocked process usually has an
+*empty* mailbox: it lists waiting, empty-mailbox processes executing project
+code, grouped by identical stack, so the hung process appears even when
+nothing has a queue. Mailboxes longer than 100 messages are reported by length
+instead of sampled — `Process.info(pid, :messages)` copies the entire mailbox,
+which is exactly wrong for the mailbox-growth case.
 
 Inside IEx the same observations are available directly:
 
 ```elixir
 BeamDebug.snapshot(MyServer)
-BeamDebug.stacktraces()      # every process, busiest mailbox first
+BeamDebug.stacktraces()      # busiest mailboxes; stacks fetched only for those
 BeamDebug.state(MyServer)
 BeamDebug.messages(MyServer)
+BeamDebug.supervisor_children(MyApp.Supervisor)
 BeamDebug.trace_calls({MyServer, :handle_call, 3}, limit: 50)
 ```
 
@@ -236,7 +258,7 @@ the order dependency being investigated.
 rather than the principal escalation mechanism. `trace` and `snapshot` are
 non-interactive and work anywhere.
 
-### Evidence journal
+### Evidence journal (optional)
 
 ```bash
 beam-debug note "cache TTL is off by 1000x" --status confirmed
@@ -246,9 +268,11 @@ beam-debug report
 ```
 
 Entries are JSONL under `${XDG_STATE_HOME:-~/.local/state}/beam-debug/<repo>/`.
-This exists so a long session does not re-test theories it already killed after
-its context is compacted, and so the final write-up is derived from recorded
-evidence instead of recollection.
+The journal is optional: it earns its keep in long sessions, complex
+investigations, and across context compaction, where it stops theories that
+already died from being re-tested. Ordinary short debugging does not need a
+note per rejected idea. `report` prints a hypothesis summary — the notes
+grouped by confirmed / killed / open — not a finished write-up.
 
 ### Structural or macro theory
 
@@ -310,25 +334,36 @@ it introduced.
 ```bash
 beam-debug doctor
 ./tests/smoke.sh
+./tests/integration.sh
 ```
 
-The smoke test checks shell/Python syntax, compilation of the BEAM helper when
-`elixirc` is available, marker detection, argument validation, journal
-round-tripping, idempotent install, hook JSON merging, and uninstall behavior in
-an isolated temporary home. It also asserts that `beam-debug test` never gains an
-implicit `--trace`.
+The smoke test checks shell/Python syntax, compilation of the BEAM helper and
+both probes when `elixirc` is available, marker detection, CLI argument
+validation, journal round-tripping, idempotent install, hook JSON merging, and
+uninstall behavior in an isolated temporary home. It also asserts that
+`beam-debug test` never gains an implicit `--trace`.
 
-The `trace` and `snapshot` paths were verified end to end against a real
-GenServer on Elixir 1.20 / OTP 28. Two things they handle that are easy to get
-wrong on a first attempt, and worth knowing if you modify them:
+The integration suite generates a throwaway Mix project and drives `trace` and
+`snapshot` end to end through the real CLI: a fast first invocation is
+captured, clean compiles and recompiles keep the trace, absent targets fail
+loudly, `--limit` stops exactly at the limit, snapshotting an ordinary
+GenServer does not crash it, a huge mailbox is not copied, a zero-mailbox
+blocked process appears in hang diagnostics, and supervisor children come only
+from `--supervisors`. It runs on the locally installed toolchain (developed
+against Elixir 1.20 / OTP 28) and skips cleanly when elixir is unavailable.
 
-- Mix prunes unused OTP applications from the code path, so `runtime_tools` is
-  often gone by the time a probe wants `:dbg`. The helper re-adds its ebin
-  directory instead of failing.
+Two failure modes the implementation specifically engineers around, worth
+knowing if you modify it:
+
+- The OTP 28 `:dbg` tracer was observed to stop handling events while
+  `mix test` runs, silently losing the whole trace. `trace_calls` therefore
+  uses raw `:erlang.trace/3` and `:erlang.trace_pattern/3` with a plain,
+  inspectable tracer process instead of `:dbg`.
 - Trace messages are delivered asynchronously and `mix test` halts the VM as
-  soon as the suite finishes, so a fast test would produce a matched trace and
-  print nothing. The helper registers a `System.at_exit` hook that waits for
-  `:erlang.trace_delivered/1` and drains the tracer's mailbox.
+  soon as the suite finishes. The probe task flushes right after the wrapped
+  task returns — waiting on `:erlang.trace_delivered/1`, then syncing the
+  tracer with a message round-trip — with a `System.at_exit` hook as backstop
+  for direct `trace_calls/2` use.
 
 ## Uninstall
 

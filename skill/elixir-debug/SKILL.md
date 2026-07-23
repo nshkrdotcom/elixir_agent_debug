@@ -5,38 +5,46 @@ description: Evidence-first debugging for Elixir, Erlang, OTP, ExUnit, GenServer
 
 # Elixir/OTP evidence-first debugging
 
-Constrain mutation and unsupported conclusions, not diagnostic breadth.
+**Explore broadly, observe efficiently, change deliberately.**
+
+Constrain mutation and unsupported conclusions, not diagnostic breadth. Match
+breadth to uncertainty: an ambiguous failure deserves several ranked candidate
+causes; a failure that is already localized deserves a fix, not a ritual.
 
 ## The loop
 
-**Generate broadly. Test efficiently. Edit cautiously.**
-
-1. Form a *ranked set* of hypotheses, not one. Five to fifteen is normal for a
-   non-obvious failure. Committing to the first plausible story is the most
-   common way a debugging session goes wrong.
-2. Identify what evidence *discriminates* between them — the observation whose
-   outcome changes the ranking, not one that merely confirms the favourite.
-3. Collect that evidence in as few runs as possible. Independent read-only
-   checks should be batched into one pass, not serialized across turns. One run
-   that captures the exception, the process state, the mailbox, the stacktraces
-   and the failing seed can eliminate eight hypotheses at once.
+1. For a non-obvious failure, consider multiple plausible causes and rank them
+   loosely. Committing to the first plausible story is the most common way a
+   debugging session goes wrong. Skip formal enumeration when the failure is
+   already localized — the exception names the defect, a compile error has one
+   obvious cause, a regression test pinpoints the malformed condition.
+2. Identify what evidence *discriminates* between the candidates — the
+   observation whose outcome changes the ranking, not one that merely confirms
+   the favourite.
+3. Collect that evidence efficiently. Batch checks when they are independent,
+   bounded, and unlikely to perturb the behavior being measured; otherwise
+   sequence them deliberately. Read-only is not the same as non-perturbing:
+   tracing shifts timing, profiling slows execution, stacktrace sweeps consume
+   scheduler time, `:sys` messages interact with the target process, and
+   concurrent test commands contend for the database, build directory and
+   ports. This matters most for races, where wide observation can make the
+   failure disappear.
 4. Update the ranking from what was observed, including values that contradict
-   the favoured theory. Record what died: `beam-debug note "..." --status killed`.
-5. Repeat until one hypothesis is supported by direct evidence.
-6. Only then edit.
+   the favoured theory.
+5. Converge on a sufficiently supported causal explanation — which may involve
+   multiple interacting causes, not always a single root cause.
 
-What stays strictly disciplined is **mutation**:
+What "change deliberately" means for edits:
 
-- Many hypotheses at once: good.
-- Many read-only checks at once: good.
-- Many instrumentation points in one run: usually good.
-- Unrelated speculative fixes combined in one patch: not acceptable.
-- Multiple changes whose individual effects cannot be separated: not acceptable.
+- an unsupported production fix: avoid;
+- a small, reversible, clearly labeled diagnostic experiment: allowed — a tiny
+  change behind an existing test is sometimes the cheapest discriminating
+  evidence, cheaper than building trace infrastructure around it;
+- an evidence-supported correction: proceed;
+- several unrelated guessed fixes in one patch: never.
 
-Multiple edits are fine when they implement one evidence-supported causal
-correction, or when each is independently verifiable. Keep every verification
-cycle causally interpretable: after the run, you must be able to say which
-change produced which change in behaviour.
+Keep every verification cycle causally interpretable: after the run, you must
+be able to say which change produced which change in behaviour.
 
 Keep the reproducer narrow — one test file, one line, one process, one message
 path — but keep the *observation* wide. Narrowing the reproducer is cheap;
@@ -45,15 +53,16 @@ have died.
 
 ## Start from the symptom
 
-Pick the row that matches what was actually observed. Do not route every problem
-through inline instrumentation.
+The table is advisory, not a routing law: pick the cheapest evidence that
+discriminates in your specific case. The exception, the failing test and the
+source are often already enough — read them first.
 
-| Symptom | First move |
+| Symptom | Useful observations |
 |---|---|
-| Deterministic test failure | Read the full exception and stacktrace, then `beam-debug trace <Mod.fun/arity> -- mix test <file>:<line>` for args and return values |
+| Deterministic test failure | The full exception and stacktrace; if values are needed, `beam-debug trace <Mod.fun/arity> -- mix test <file>:<line>` for args and return values |
 | Flaky / order-dependent | Preserve the failing seed, then `mix test --seed <that seed> --repeat-until-failure 50` |
-| Hangs or times out | `beam-debug snapshot --after <ms> -- mix test <file>:<line>` — current stacktraces show where it is blocked |
-| Crashes and restarts | The crash report and the supervisor's state, not the callback source |
+| Hangs or times out | `beam-debug snapshot --after <ms> -- mix test <file>:<line>` — stacktraces and the blocked-process census show where it is stuck |
+| Crashes and restarts | The crash report and the supervisor's state; the callback source once the report points at it |
 | Wrong GenServer/Agent state | `beam-debug snapshot --names MyApp.Worker -- mix test <file>:<line>`, or `:sys.get_state` at a chosen point |
 | Mailbox growth / stuck consumer | `message_queue_len` and mailbox sample from the same snapshot |
 | Slow | `mix test --slowest 10`, then `mix profile.eprof` / `mix profile.cprof` |
@@ -66,17 +75,25 @@ through inline instrumentation.
 ## Observe without editing source
 
 Prefer this when the target is a function, a process, or a hang. It edits
-nothing, so there is nothing to clean up and nothing to leave behind.
+nothing, so there is nothing to clean up and nothing to leave behind. It is
+not free, though — tracing and snapshots have runtime cost and can shift
+timing; account for that when the symptom is itself timing-sensitive.
 
 ```bash
 beam-debug trace MyApp.Worker.handle_call/3 -- mix test test/worker_test.exs:42
+beam-debug trace :gen_server.call/3 --limit 20 -- mix test test/worker_test.exs
 beam-debug trace MyApp.Worker --limit 50 --for 2000 -- mix test test/worker_test.exs
 ```
 
-`trace` installs a bounded `:dbg` call trace from a probe file outside the
-repository. It reports arguments, return values and exceptions, for local as
-well as exported functions, including code you cannot edit. It stops itself
-after `--limit` events (default 200) and after `--for` milliseconds if given.
+`trace` installs a bounded call trace from a probe outside the repository and
+reports arguments, return values and exceptions, for local as well as exported
+functions, including code you cannot edit. Erlang modules use the `:mod`,
+`:mod.fun`, `:mod.fun/arity` form. Installation is synchronous — the project
+is compiled and the pattern verified before the wrapped command starts, so a
+fast first call cannot be missed, and a target that never loads or matches
+nothing fails the run with an explicit diagnostic instead of printing nothing.
+It stops at exactly `--limit` events (default 200) and after `--for`
+milliseconds if given.
 
 Its cost is real: keep the target specific. `Mod` with no function traces every
 function in the module and will flood a busy run. Prefer `Mod.fun/arity`.
@@ -85,29 +102,44 @@ For a hang, a deadlock, or a slow test:
 
 ```bash
 beam-debug snapshot --after 5000 --names MyApp.Worker,MyApp.Cache -- mix test test/slow_test.exs
+beam-debug snapshot --after 5000 --supervisors MyApp.Supervisor -- mix test test/slow_test.exs
 ```
 
-The watchdog fires at a wall-clock time you choose, while the system is still
-running, and dumps state, mailbox sample, current stacktrace, links, monitors
-and supervisor children for the named processes plus the busiest ones on the
-node. Timing is explicit on purpose: ExUnit tears down supervised processes as
-soon as a test finishes, so anything that captures *after* the failure finds
+The watchdog fires at a wall-clock time you choose — measured from the start
+of the wrapped task, after compilation — while the system is still running.
+Timing is explicit on purpose: ExUnit tears down supervised processes as soon
+as a test finishes, so anything that captures *after* the failure finds
 nothing left to inspect.
+
+The report contains: full snapshots of the `--names` targets (state, mailbox
+sample, stacktrace, links, monitors), children of the `--supervisors` targets,
+the busiest mailboxes, the busiest processes by reductions, the largest by
+memory, and a census of blocked application processes — waiting, empty
+mailbox, executing project code — because a deadlocked process usually has an
+*empty* mailbox and would be invisible in a mailbox ranking.
+
+Only `--names` targets receive `:sys` system messages and only
+`--supervisors` targets are asked for children: either protocol aimed at a
+process that does not implement it is slow, noisy, or crashes the callee.
+Mailboxes longer than 100 messages are reported by length instead of sampled,
+because `Process.info(pid, :messages)` copies the entire mailbox.
 
 Inside an IEx session the same observations are available directly:
 
 ```elixir
 BeamDebug.snapshot(MyApp.Worker)
-BeamDebug.stacktraces()          # every process, busiest mailbox first
+BeamDebug.stacktraces()          # busiest mailboxes; stacks fetched only for those
 BeamDebug.state(MyApp.Worker)
 BeamDebug.messages(MyApp.Worker)
+BeamDebug.supervisor_children(MyApp.Supervisor)
 BeamDebug.trace_calls({MyApp.Worker, :handle_call, 3}, limit: 50)
 BeamDebug.stop_calls()
 ```
 
-The underlying built-ins are `:dbg`, `:sys.get_state/2`, `:sys.get_status/2`,
-`:sys.trace/2,3` and `Process.info/2`. Note that `:sys.*` only works on OTP
-behaviours; `:dbg` works on anything.
+`trace_calls` is built on `:erlang.trace/3` and `:erlang.trace_pattern/3`; the
+other observations use `:sys.get_state/2`, `:sys.get_status/2` and
+`Process.info/2`. Note that `:sys.*` only works on OTP behaviours. An existing
+tracer is never replaced silently — pass `replace: true` to take tracing over.
 
 ## Inline instrumentation: a real fallback, not the default
 
@@ -168,6 +200,23 @@ session when one is genuinely needed.
 `IEx.break!/2,4` sets a breakpoint on a function without editing source and is
 usually preferable to inserting a `pry` call.
 
+## Optional: the evidence journal
+
+`beam-debug note` / `history` / `report` keep a small per-repository JSONL
+record of hypotheses and what the evidence did to them. It is optional — use
+it for long sessions, complex investigations, or when context compaction may
+lose what was already ruled out. Ordinary short debugging does not need a note
+per dead theory.
+
+```bash
+beam-debug note "cache TTL off by 1000x" --status confirmed --evidence "trace shows ms vs s"
+beam-debug history
+beam-debug report      # hypothesis summary grouped by status
+```
+
+`report` is a hypothesis summary, not a finished write-up: it groups the notes
+by confirmed / killed / open.
+
 ## Optional tools, not baseline requirements
 
 Use `recon`, `observer_cli`, Sourceror or StreamData when they are already
@@ -194,8 +243,7 @@ Then run the narrowest relevant regression test. If the failure was flaky, re-ru
 with the recorded seed and `--repeat-until-failure`. Run broader tests only when
 scope and risk justify it.
 
-`beam-debug report` turns the journal into the skeleton of the final write-up.
-Distinguish, explicitly:
+In the final write-up, distinguish explicitly:
 
 - evidence observed;
 - hypotheses ruled out, and by what evidence;

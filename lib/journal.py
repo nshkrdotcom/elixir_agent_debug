@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Per-repository evidence journal for the elixir-debug workflow.
 
-Records hypotheses and what the observed evidence did to them, so a long
-debugging session does not re-test theories it already killed and so the final
-report can be derived from recorded evidence instead of recollection.
+Optional. Records hypotheses and what the observed evidence did to them, so a
+long debugging session does not re-test theories it already killed. `report`
+prints a hypothesis summary — the notes grouped by status — not a finished
+write-up.
 """
 
 import argparse
@@ -92,6 +93,8 @@ def command_report(args):
     for entry in entries:
         grouped.setdefault(entry.get("status", "open"), []).append(entry)
 
+    print("# Hypothesis summary")
+    print("")
     headings = (
         ("confirmed", "Confirmed by evidence"),
         ("killed", "Ruled out by evidence"),

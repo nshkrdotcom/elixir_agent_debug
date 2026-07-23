@@ -23,8 +23,8 @@ Run tests:
 
 Observe without editing source:
   trace <target> [opts] [-- mix ...]
-                              Bounded :dbg call trace of an MFA target,
-                              installed synchronously before the command runs.
+                              Bounded call trace of an MFA target, installed
+                              synchronously before the command runs.
                               target: Mod | Mod.fun | Mod.fun/arity
                                       :mod | :mod.fun | :mod.fun/arity (Erlang)
                               opts:  --limit N (default 200; stops at event N)
