@@ -23,22 +23,32 @@ Run tests:
 
 Observe without editing source:
   trace <target> [opts] [-- mix ...]
-                              Bounded :dbg call trace of an MFA target.
+                              Bounded :dbg call trace of an MFA target,
+                              installed synchronously before the command runs.
                               target: Mod | Mod.fun | Mod.fun/arity
-                              opts:  --limit N (default 200 events)
+                                      :mod | :mod.fun | :mod.fun/arity (Erlang)
+                              opts:  --limit N (default 200; stops at event N)
                                      --for MS  (also stop after MS ms)
   snapshot [opts] [-- mix ...]
                               Run a command with a watchdog that dumps process
                               state, mailboxes, current stacktraces, links,
-                              monitors and supervisor children at a chosen time.
-                              opts:  --after MS   (default 5000)
-                                     --names A,B  (explicit registered names)
-                                     --top N      (default 10, by queue length)
+                              monitors and a blocked-process census at a chosen
+                              time.
+                              opts:  --after MS        (default 5000, measured
+                                                        from the start of the
+                                                        wrapped task, after
+                                                        compilation)
+                                     --names A,B       (only these registered
+                                                        names get :sys probes)
+                                     --supervisors A,B (only these are asked
+                                                        for their children)
+                                     --top N           (default 10, by queue
+                                                        length)
 
-Evidence journal (per repository):
+Evidence journal (optional, per repository):
   note <text> [--status open|confirmed|killed] [--evidence TEXT]
   history [--limit N]         Print journal entries, newest last
-  report                      Group the journal into a report skeleton
+  report                      Summarize journal hypotheses by status
 
 Other:
   doctor                      Check the local install and BEAM toolchain
@@ -135,11 +145,25 @@ capture() {
   return "$status"
 }
 
-# Split "<opts...> [-- <command...>]" and run the command under a probe file.
-# Defaults to `mix test` when no explicit command is given.
+# require_int <option> <value> <minimum>
+require_int() {
+  if ! [[ "${2-}" =~ ^[0-9]+$ ]]; then
+    printf 'beam-debug: %s needs a nonnegative integer, got: %s\n' "$1" "${2:-<empty>}" >&2
+    exit 2
+  fi
+  if (( 10#$2 < $3 )); then
+    printf 'beam-debug: %s must be at least %s\n' "$1" "$3" >&2
+    exit 2
+  fi
+}
+
+# Split "<opts...> [-- <command...>]" and run the command through a probe Mix
+# task (`mix beam_debug.trace <task> <args>`), so instrumentation is installed
+# after compilation but before the wrapped task starts. Defaults to `mix test`
+# when no explicit command is given.
 run_with_probe() {
-  local probe="$1"
-  shift
+  local task="$1" probe="$2"
+  shift 2
   need elixir
   need mix
 
@@ -156,17 +180,27 @@ run_with_probe() {
     command=(mix test)
   fi
   if [[ "${command[0]}" != "mix" ]]; then
-    printf 'beam-debug: the traced command must start with `mix` (got: %s)\n' "${command[0]}" >&2
+    printf 'beam-debug: the wrapped command must start with `mix` (got: %s)\n' "${command[0]}" >&2
     exit 2
   fi
 
-  exec elixir -r "$HELPER" -r "$probe" -S "${command[@]}"
+  local -a wrapped=("${command[@]:1}")
+  if [[ "${#wrapped[@]}" -eq 0 ]]; then
+    wrapped=(test)
+  fi
+  # The probe task wraps the real one, so `mix test`'s own env inference never
+  # runs; set the env it would have chosen.
+  if [[ "${wrapped[0]}" == "test" ]]; then
+    export MIX_ENV="${MIX_ENV:-test}"
+  fi
+
+  exec elixir -r "$HELPER" -r "$probe" -S mix "$task" "${wrapped[@]}"
 }
 
 trace() {
   local target="" limit=200 duration=0
   if [[ $# -eq 0 || "$1" == "--" || "$1" == --* ]]; then
-    printf 'beam-debug trace: missing target (Mod | Mod.fun | Mod.fun/arity)\n' >&2
+    printf 'beam-debug trace: missing target (Mod | Mod.fun | Mod.fun/arity | :mod.fun/arity)\n' >&2
     exit 2
   fi
   target="$1"
@@ -175,8 +209,8 @@ trace() {
   local -a rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --limit) limit="${2:?--limit needs a value}"; shift 2 ;;
-      --for) duration="${2:?--for needs a value}"; shift 2 ;;
+      --limit) require_int --limit "${2-}" 1; limit="$2"; shift 2 ;;
+      --for) require_int --for "${2-}" 0; duration="$2"; shift 2 ;;
       --) rest=("$@"); break ;;
       *) printf 'beam-debug trace: unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -185,17 +219,18 @@ trace() {
   export BEAM_DEBUG_TRACE_TARGET="$target"
   export BEAM_DEBUG_TRACE_LIMIT="$limit"
   export BEAM_DEBUG_TRACE_FOR="$duration"
-  run_with_probe "$PROBE_TRACE" "${rest[@]+"${rest[@]}"}"
+  run_with_probe beam_debug.trace "$PROBE_TRACE" "${rest[@]+"${rest[@]}"}"
 }
 
 snapshot() {
-  local after=5000 names="" top=10
+  local after=5000 names="" top=10 supervisors=""
   local -a rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --after) after="${2:?--after needs a value}"; shift 2 ;;
+      --after) require_int --after "${2-}" 0; after="$2"; shift 2 ;;
       --names) names="${2:?--names needs a value}"; shift 2 ;;
-      --top) top="${2:?--top needs a value}"; shift 2 ;;
+      --supervisors) supervisors="${2:?--supervisors needs a value}"; shift 2 ;;
+      --top) require_int --top "${2-}" 0; top="$2"; shift 2 ;;
       --) rest=("$@"); break ;;
       *) printf 'beam-debug snapshot: unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -203,8 +238,9 @@ snapshot() {
 
   export BEAM_DEBUG_SNAPSHOT_AFTER="$after"
   export BEAM_DEBUG_SNAPSHOT_NAMES="$names"
+  export BEAM_DEBUG_SNAPSHOT_SUPERVISORS="$supervisors"
   export BEAM_DEBUG_SNAPSHOT_TOP="$top"
-  run_with_probe "$PROBE_SNAPSHOT" "${rest[@]+"${rest[@]}"}"
+  run_with_probe beam_debug.snapshot "$PROBE_SNAPSHOT" "${rest[@]+"${rest[@]}"}"
 }
 
 command="${1:-help}"

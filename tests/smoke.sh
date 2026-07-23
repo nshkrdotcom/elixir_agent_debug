@@ -21,10 +21,12 @@ grep -q 'exec iex -r "\$HELPER" -S mix test --trace' "$ROOT/bin/beam-debug" \
 printf 'Checking Elixir helper and probe syntax...\n'
 if command -v elixirc >/dev/null 2>&1; then
   probe_out="$(mktemp -d)"
-  for source in "$ROOT/support/beam_debug.exs"; do
-    (cd "$probe_out" && elixirc "$source" >/dev/null) \
-      || fail "failed to compile $source"
-  done
+  # One invocation so the probes can reference the helper module.
+  (cd "$probe_out" && elixirc \
+    "$ROOT/support/beam_debug.exs" \
+    "$ROOT/support/probe_trace.exs" \
+    "$ROOT/support/probe_snapshot.exs" >/dev/null) \
+    || fail 'failed to compile the BEAM helper and probes'
   rm -rf -- "$probe_out"
 else
   printf 'note: elixirc not available; skipped BEAM helper compilation.\n'
@@ -153,6 +155,18 @@ if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace >/dev/null 2>&1); then
 fi
 if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace Foo --bogus >/dev/null 2>&1); then
   fail 'trace should reject unknown options'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace Foo --limit banana >/dev/null 2>&1); then
+  fail 'trace should reject a non-integer --limit'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace Foo --limit 0 >/dev/null 2>&1); then
+  fail 'trace should reject --limit 0'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" snapshot --after -5 >/dev/null 2>&1); then
+  fail 'snapshot should reject a negative --after'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" snapshot --top x >/dev/null 2>&1); then
+  fail 'snapshot should reject a non-integer --top'
 fi
 (
   cd "$repo"
