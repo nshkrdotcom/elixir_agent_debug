@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 *.elixir-agent-debug.bak
+runtime-paths.conf

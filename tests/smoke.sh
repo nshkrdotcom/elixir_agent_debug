@@ -171,6 +171,33 @@ hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false
   | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook still active after end: $hook_out"
 
+printf 'Checking untracked-file scan hardening (symlinks, non-regular files)...\n'
+mkfifo "$repo/direct.ex"
+mkfifo "$repo/fifo_target"
+ln -s fifo_target "$repo/hang.ex"
+printf 'contains a BEAMDBG marker\n' > "$repo/notes.txt"
+ln -s notes.txt "$repo/alias.ex"
+scan_out="$(cd "$repo" && timeout 15 python3 -I -S "$ROOT/hooks/stop_guard.py" --scan)" \
+  || fail 'scan blocked or failed on symlinked/non-regular untracked files'
+printf '%s' "$scan_out" | grep -q 'hang.ex' && fail 'scan read through a symlink to a FIFO'
+printf '%s' "$scan_out" | grep -q 'direct.ex' && fail 'scan read a FIFO directly'
+printf '%s' "$scan_out" | grep -q 'alias.ex' && fail 'scan followed a symlink to file content'
+rm -f "$repo/direct.ex" "$repo/fifo_target" "$repo/hang.ex" "$repo/notes.txt" "$repo/alias.ex"
+
+printf 'Checking state file permissions (ledger)...\n'
+sessions_dir="$(find "$state" -type d -name sessions | head -1)"
+[[ -n "$sessions_dir" ]] || fail 'no sessions directory was created'
+[[ "$(stat -c %a "$sessions_dir")" == "700" ]] \
+  || fail "sessions directory is not 0700: $(stat -c %a "$sessions_dir")"
+ledger_token="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-perms | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
+ledger_file="$(find "$sessions_dir" -name "$ledger_token.json" | head -1)"
+[[ -n "$ledger_file" ]] || fail 'ledger file not found'
+[[ "$(stat -c %a "$ledger_file")" == "600" ]] \
+  || fail "ledger file is not 0600: $(stat -c %a "$ledger_file")"
+(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$ledger_token" >/dev/null) \
+  || fail 'could not retire the permissions-test ledger'
+
 printf 'Checking Erlang marker coverage (unstaged, staged, untracked)...\n'
 cat > "$repo/sample.erl" <<'ERLANG'
 -module(sample).
@@ -215,9 +242,10 @@ export ELIXIR_AGENT_DEBUG_HOME="$HOME/.local/share/elixir-agent-debug"
 mkdir -p "$HOME/.claude" "$HOME/.codex"
 printf '# Existing Claude preference\n' > "$HOME/.claude/CLAUDE.md"
 printf '# Existing Codex preference\n' > "$HOME/.codex/AGENTS.md"
-# Each config carries an unrelated hook that must survive, plus a legacy
-# pre-1.4.3 package hook (plain python3) that the upgrade must migrate to the
-# isolated form instead of leaving a second entry firing beside it.
+# Each config carries an unrelated hook that must survive, plus every legacy
+# package hook-command form — plain python3 (pre-1.4.3) and PATH-resolved
+# python3 -I -S (1.4.3) — which the upgrade must migrate to one absolute
+# isolated entry instead of leaving old forms firing beside it.
 cat > "$HOME/.claude/settings.json" <<JSON
 {
   "theme": "existing",
@@ -226,7 +254,8 @@ cat > "$HOME/.claude/settings.json" <<JSON
       {
         "hooks": [
           {"type": "command", "command": "echo existing-claude"},
-          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
+          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"},
+          {"type": "command", "command": "python3 -I -S $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
         ]
       }
     ]
@@ -241,7 +270,8 @@ cat > "$HOME/.codex/hooks.json" <<JSON
       {
         "hooks": [
           {"type": "command", "command": "echo existing-codex"},
-          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
+          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"},
+          {"type": "command", "command": "python3 -I -S $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
         ]
       }
     ]
@@ -274,10 +304,12 @@ for index, name in enumerate(sys.argv[1:]):
     entries = data["hooks"]["Stop"]
     commands = [hook["command"] for entry in entries for hook in entry["hooks"]]
     package = [value for value in commands if "elixir-agent-debug/hooks/stop_guard.py" in value]
-    # Exactly one package hook: the legacy plain-python3 entry must have been
-    # migrated, not joined, and the survivor runs isolated Python.
+    # Exactly one package hook: both legacy forms must have been migrated,
+    # not joined, and the survivor runs an absolute interpreter isolated
+    # from PATH and Python environment injection.
     assert len(package) == 1, (name, package)
-    assert package[0].startswith("python3 -I -S "), (name, package)
+    assert package[0].startswith("/"), (name, package)
+    assert " -I -S " in package[0], (name, package)
     assert expected_existing[index] in commands, (name, commands)
 PY
 
@@ -338,6 +370,17 @@ set -e
   cd "$repo"
   "$HOME/.local/bin/beam-debug" latest | grep -q 'captured-output'
 ) || fail 'captured log was not retrievable'
+
+journal_file="$(find "$HOME/.local/state/beam-debug" -name journal.jsonl | head -1)"
+[[ -n "$journal_file" ]] || fail 'journal file not found'
+[[ "$(stat -c %a "$journal_file")" == "600" ]] \
+  || fail "journal is not 0600: $(stat -c %a "$journal_file")"
+capture_log="$(find "$HOME/.local/state/beam-debug" -name latest.log | head -1)"
+[[ -n "$capture_log" ]] || fail 'capture log not found'
+[[ "$(stat -c %a "$capture_log")" == "600" ]] \
+  || fail "capture log is not 0600: $(stat -c %a "$capture_log")"
+[[ "$(stat -c %a "$(dirname -- "$capture_log")")" == "700" ]] \
+  || fail "state directory is not 0700: $(stat -c %a "$(dirname -- "$capture_log")")"
 
 printf 'Checking per-project manifest and version floor...\n'
 if python3 -c 'import tomllib' >/dev/null 2>&1; then

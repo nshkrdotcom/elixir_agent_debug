@@ -11,6 +11,39 @@ PROBE_TRACE="$ROOT/support/probe_trace.exs"
 PROBE_SNAPSHOT="$ROOT/support/probe_snapshot.exs"
 PACKAGE_VERSION="$(cat -- "$ROOT/VERSION" 2>/dev/null || printf '0.0.0')"
 
+# Trusted absolute binary paths, recorded by install.sh while PATH was the
+# installing user's own. A project environment can prepend PATH (direnv,
+# venv, a repo bin/) and substitute python3 or git; resolving through this
+# file instead closes that. Running uninstalled from a checkout (no conf)
+# falls back to PATH — a development convenience, not the hardened mode.
+RUNTIME_CONF="$ROOT/lib/runtime-paths.conf"
+PYTHON3_BIN=""
+GIT_BIN=""
+if [[ -r "$RUNTIME_CONF" ]]; then
+  PYTHON3_BIN="$(sed -n 's/^python3=//p' "$RUNTIME_CONF" | head -1)"
+  GIT_BIN="$(sed -n 's/^git=//p' "$RUNTIME_CONF" | head -1)"
+fi
+if [[ -z "$PYTHON3_BIN" || ! -x "$PYTHON3_BIN" ]]; then
+  PYTHON3_BIN="$(command -v python3 || true)"
+fi
+if [[ -z "$GIT_BIN" || ! -x "$GIT_BIN" ]]; then
+  GIT_BIN="$(command -v git || true)"
+fi
+
+need_python3() {
+  if [[ -z "$PYTHON3_BIN" || ! -x "$PYTHON3_BIN" ]]; then
+    printf 'beam-debug: python3 not found (checked runtime-paths.conf and PATH)\n' >&2
+    exit 127
+  fi
+}
+
+need_git() {
+  if [[ -z "$GIT_BIN" || ! -x "$GIT_BIN" ]]; then
+    printf 'beam-debug: git not found (checked runtime-paths.conf and PATH)\n' >&2
+    exit 127
+  fi
+}
+
 usage() {
   cat <<'USAGE'
 Usage: beam-debug <command> [args]
@@ -85,7 +118,7 @@ USAGE
 
 repo_identity() {
   local root
-  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  root="$("$GIT_BIN" rev-parse --show-toplevel 2>/dev/null || pwd -P)"
   printf '%s' "$root" | sha256sum | cut -c1-16
 }
 
@@ -114,7 +147,7 @@ need() {
 
 project_manifest() {
   local root
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  root="$("$GIT_BIN" rev-parse --show-toplevel 2>/dev/null)" || return 1
   [[ -f "$root/.beam-debug.toml" ]] || return 1
   printf '%s/.beam-debug.toml\n' "$root"
 }
@@ -130,8 +163,8 @@ floor_satisfied() {
 # fails closed on invalid TOML, duplicate or unknown keys, quoted booleans,
 # and missing or non-version values.
 manifest_floor() {
-  need python3
-  python3 -I -S "$ROOT/lib/project_manifest.py" "$1"
+  need_python3
+  "$PYTHON3_BIN" -I -S "$ROOT/lib/project_manifest.py" "$1"
 }
 
 require_project_floor() {
@@ -149,10 +182,10 @@ require_project_floor() {
 }
 
 init_project() {
-  need git
-  need python3
+  need_git
+  need_python3
   local root
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  root="$("$GIT_BIN" rev-parse --show-toplevel 2>/dev/null)" || {
     printf 'beam-debug init-project: not inside a git worktree.\n' >&2
     exit 2
   }
@@ -183,8 +216,8 @@ init_project() {
     printf 'Wrote %s (minimum_version = "%s")\n' "$manifest" "$PACKAGE_VERSION"
   fi
 
-  python3 -I -S "$MANAGER" block-add "$root/CLAUDE.md" "$ROOT/adapters/project-instructions.md"
-  python3 -I -S "$MANAGER" block-add "$root/AGENTS.md" "$ROOT/adapters/project-instructions.md"
+  "$PYTHON3_BIN" -I -S "$MANAGER" block-add "$root/CLAUDE.md" "$ROOT/adapters/project-instructions.md"
+  "$PYTHON3_BIN" -I -S "$MANAGER" block-add "$root/AGENTS.md" "$ROOT/adapters/project-instructions.md"
   printf 'Added the project note to %s and %s (idempotent; safe to rerun).\n' \
     "$root/CLAUDE.md" "$root/AGENTS.md"
   printf 'Commit .beam-debug.toml, CLAUDE.md and AGENTS.md to share this with the team.\n'
@@ -196,6 +229,11 @@ doctor() {
   local failed=0
   printf 'elixir-agent-debug root: %s\n' "$ROOT"
   printf 'version: %s\n' "$PACKAGE_VERSION"
+  printf 'trusted python3: %s\n' "${PYTHON3_BIN:-<not found>}"
+  printf 'trusted git: %s\n' "${GIT_BIN:-<not found>}"
+  if [[ ! -r "$RUNTIME_CONF" ]]; then
+    printf 'note: no runtime-paths.conf (running from a checkout?); binaries resolve via PATH.\n'
+  fi
 
   for command in bash python3 git sha256sum; do
     if command -v "$command" >/dev/null 2>&1; then
@@ -215,8 +253,8 @@ doctor() {
     fi
   done
 
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    printf 'ok: git repo   %s\n' "$(git rev-parse --show-toplevel)"
+  if "$GIT_BIN" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'ok: git repo   %s\n' "$("$GIT_BIN" rev-parse --show-toplevel)"
   else
     printf 'note: current directory is not inside a git worktree; marker scanning is inactive here.\n'
   fi
@@ -265,7 +303,12 @@ capture() {
 
   local output status
   output="$(log_path)"
-  mkdir -p -- "$(dirname -- "$output")"
+  # Captured output can contain credentials and private data: state
+  # directories are 0700 and the log itself 0600, fixing up legacy modes.
+  (umask 077; mkdir -p -- "$(dirname -- "$output")")
+  chmod 0700 -- "$(dirname -- "$output")" "$(dirname -- "$(dirname -- "$output")")" 2>/dev/null || true
+  : > "$output"
+  chmod 0600 -- "$output"
   printf '$' | tee "$output"
   printf ' %q' "$@" | tee -a "$output"
   printf '\n' | tee -a "$output"
@@ -437,24 +480,24 @@ case "$command" in
     cat -- "$file"
     ;;
   note|history|report)
-    need python3
-    exec python3 -I -S "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
+    need_python3
+    exec "$PYTHON3_BIN" -I -S "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
     ;;
   begin)
-    need python3
-    exec python3 -I -S "$GUARD" --begin "$@"
+    need_python3
+    exec "$PYTHON3_BIN" -I -S "$GUARD" --begin "$@"
     ;;
   end)
-    need python3
-    exec python3 -I -S "$GUARD" --end "$@"
+    need_python3
+    exec "$PYTHON3_BIN" -I -S "$GUARD" --end "$@"
     ;;
   scan)
-    need python3
-    exec python3 -I -S "$GUARD" --scan
+    need_python3
+    exec "$PYTHON3_BIN" -I -S "$GUARD" --scan
     ;;
   assert-clean)
-    need python3
-    exec python3 -I -S "$GUARD" --assert-clean
+    need_python3
+    exec "$PYTHON3_BIN" -I -S "$GUARD" --assert-clean
     ;;
   help|-h|--help)
     usage

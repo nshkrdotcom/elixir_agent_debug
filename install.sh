@@ -108,6 +108,20 @@ chmod 0755 -- "$TARGET/lib/journal.py"
 chmod 0755 -- "$TARGET/lib/project_manifest.py"
 chmod 0755 -- "$TARGET/uninstall.sh"
 MANAGER="$TARGET/lib/manage_install.py"
+
+# Record trusted absolute binary paths now, while PATH is the installing
+# user's own. Everything package-owned resolves python3 and git through this
+# file afterwards, so a project-prepended PATH (direnv, venv, a repo bin/)
+# cannot substitute either binary under the Stop hook or the CLI.
+PYTHON3_BIN="$(readlink -f -- "$(command -v python3)")"
+if command -v git >/dev/null 2>&1; then
+  GIT_BIN="$(readlink -f -- "$(command -v git)")"
+else
+  GIT_BIN=""
+fi
+printf 'python3=%s\ngit=%s\n' "$PYTHON3_BIN" "$GIT_BIN" > "$TARGET/lib/runtime-paths.conf"
+chmod 0644 -- "$TARGET/lib/runtime-paths.conf"
+
 install_command
 
 manager_args=(configure "$HOME" "$TARGET")
@@ -125,7 +139,7 @@ fi
 if [[ "$REMOVE_HOOKS" -eq 1 ]]; then
   manager_args+=(--remove-hooks)
 fi
-python3 -I -S "$MANAGER" "${manager_args[@]}"
+"$PYTHON3_BIN" -I -S "$MANAGER" "${manager_args[@]}"
 
 printf 'Installed elixir-agent-debug at %s\n' "$TARGET"
 printf 'Command: %s\n' "$HOME/.local/bin/beam-debug"

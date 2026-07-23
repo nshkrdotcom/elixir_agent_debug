@@ -10,6 +10,7 @@ write-up.
 import argparse
 import json
 from datetime import datetime
+import os
 from pathlib import Path
 import sys
 
@@ -43,6 +44,13 @@ def command_note(args):
     # type: (argparse.Namespace) -> int
     path = journal_path(args.state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Notes can quote private evidence; keep state directories 0700 and the
+    # journal itself 0600.
+    for directory in (path.parent, path.parent.parent):
+        try:
+            os.chmod(str(directory), 0o700)
+        except OSError:
+            pass
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "status": args.status,
@@ -50,8 +58,13 @@ def command_note(args):
     }
     if args.evidence:
         entry["evidence"] = args.evidence
-    with path.open("a", encoding="utf-8") as handle:
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
     print("{} [{}] {}".format(entry["ts"], entry["status"], entry["text"]))
     return 0
 

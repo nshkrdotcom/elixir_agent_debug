@@ -15,6 +15,10 @@ A deliberately small, user-level debugging layer for **Claude Code CLI** and
 It gives both agents the same evidence-first Elixir/OTP workflow without an MCP
 server, daemon, custom agent tree, or required Hex dependency.
 
+New here? **[How elixir_agent_debug works](docs/how_elixir_agent_debug_works.md)**
+walks through the whole thing — what it does, the reasoning discipline it
+encodes, and what each tool is for.
+
 The rule it encodes is **explore broadly, observe efficiently, change
 deliberately**:
 
@@ -235,7 +239,9 @@ handling — credentials, tokens, private messages, user records. Treat that
 output like the data itself: do not paste it into write-ups, notes or commits
 beyond what the diagnosis needs, and remember that `beam-debug capture`
 persists it to the state directory (`${XDG_STATE_HOME:-~/.local/state}/beam-debug/`),
-where it stays until you delete it.
+where it stays until you delete it. State directories are created `0700` and
+state files — capture logs, journals, marker ledgers — `0600`, so other
+local users cannot read them.
 
 ### Observe without editing the repository
 
@@ -505,12 +511,19 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
   or any internal error all mean the stop proceeds silently; it never falls
   back to a global scan;
 - never edits source files itself;
-- runs isolated Python (`python3 -I -S`, like every package-owned Python
-  process): the interpreter ignores `PYTHONPATH`, user site-packages and
-  `sitecustomize`, so a project environment cannot inject code into the hook
-  or corrupt the scripts' output protocols. Upgrading with `--hooks`
-  migrates a legacy plain-`python3` hook entry to the isolated form rather
-  than leaving both installed.
+- runs isolated Python by absolute path: the hook command pins the
+  interpreter path recorded at install time and passes `-I -S`, and the
+  scripts resolve `git` through the same install-time record
+  (`lib/runtime-paths.conf`) — so a project environment can neither
+  substitute the binaries via a prepended `PATH` (direnv, venv, a repo
+  `bin/`) nor inject code via `PYTHONPATH`/`sitecustomize`, and cannot
+  corrupt the scripts' output protocols. Upgrading with `--hooks` migrates
+  every earlier hook-command form (plain `python3`, PATH-resolved
+  `python3 -I -S`, older absolute paths) to one current entry;
+- reads untracked files defensively: symlinks are never followed, only
+  regular files are read (a FIFO or device node is skipped, not waited on),
+  and reads are capped at 1 MiB — an untracked path in a repository is
+  attacker-suggestible and must not be able to hang or exhaust the hook.
 
 On Codex, session metadata in hook payloads is less established; when the
 expected fields are absent the hook simply stays inert, and `assert-clean`

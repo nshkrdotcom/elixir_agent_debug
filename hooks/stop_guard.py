@@ -40,6 +40,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
@@ -47,6 +48,31 @@ from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 MARKER = "BEAMDBG"
 SOURCE_GLOBS = ("*.ex", "*.exs", "*.erl", "*.hrl")
 SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
+
+# Untracked files larger than this are skipped: source files are small, and
+# an unbounded read is a resource hazard, not better coverage.
+MAX_UNTRACKED_BYTES = 1 << 20
+
+
+def _git_binary():
+    # type: () -> str
+    # The install records trusted absolute binary paths in
+    # lib/runtime-paths.conf. Resolving `git` through PATH instead would let
+    # a project environment (direnv, venv activation, a prepended repo
+    # directory) substitute its own executable under the Stop hook.
+    conf = Path(__file__).resolve().parent.parent / "lib" / "runtime-paths.conf"
+    try:
+        for line in conf.read_text(encoding="utf-8").splitlines():
+            if line.startswith("git="):
+                candidate = line[len("git="):].strip()
+                if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+    except OSError:
+        pass
+    return "git"
+
+
+GIT = _git_binary()
 
 
 class Finding(NamedTuple):
@@ -59,7 +85,7 @@ class Finding(NamedTuple):
 def git(root_or_cwd, *args):
     # type: (Path, *str) -> subprocess.CompletedProcess
     return subprocess.run(
-        ["git", "-C", str(root_or_cwd)] + list(args),
+        [GIT, "-C", str(root_or_cwd)] + list(args),
         universal_newlines=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -127,10 +153,41 @@ def diff_findings(root, cached, needle):
     return list(parse_diff(result.stdout, "staged" if cached else "working tree", needle))
 
 
+def read_untracked_lines(path):
+    # type: (Path) -> List[str]
+    # An untracked path is attacker-suggestible: a symlink to a FIFO would
+    # block the Stop hook forever, and a link to /dev/zero would consume
+    # memory without bound. Open without following symlinks and without
+    # blocking, accept regular files only, and cap how much is read.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError:
+        return []
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_UNTRACKED_BYTES:
+            return []
+        chunks = []
+        remaining = MAX_UNTRACKED_BYTES
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    except OSError:
+        return []
+    finally:
+        os.close(descriptor)
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
 def untracked_findings(root, needle):
     # type: (Path, str) -> List[Finding]
     command = [
-        "git",
+        GIT,
         "-C",
         str(root),
         "ls-files",
@@ -153,12 +210,7 @@ def untracked_findings(root, needle):
         if not raw_path:
             continue
         relative = raw_path.decode(errors="surrogateescape")
-        path = root / relative
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for number, line in enumerate(text.splitlines(), start=1):
+        for number, line in enumerate(read_untracked_lines(root / relative), start=1):
             if needle in line:
                 findings.append(Finding(relative, number, line.strip(), "untracked"))
     return findings
@@ -321,15 +373,26 @@ def begin(cwd, explicit_session):
     token = secrets.token_hex(4)
     directory = sessions_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
+    # Ledgers and everything else under the state directory can reference
+    # private work; keep state directories 0700 and state files 0600.
+    for level in (directory, directory.parent, directory.parent.parent):
+        try:
+            os.chmod(str(level), 0o700)
+        except OSError:
+            pass
     entry = {
         "token": token,
         "session_id": session_id,
         "repo": str(root),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    (directory / (token + ".json")).write_text(
-        json.dumps(entry, indent=2) + "\n", encoding="utf-8"
+    descriptor = os.open(
+        str(directory / (token + ".json")),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
     )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, indent=2) + "\n")
     print_begin_instructions(token, session_id, reused=False)
     return 0
 

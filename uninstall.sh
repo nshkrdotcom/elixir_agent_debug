@@ -13,7 +13,15 @@ else
   exit 1
 fi
 
-python3 -I -S "$MANAGER" deconfigure "$HOME" "$TARGET"
+PYTHON3_BIN=""
+if [[ -r "$TARGET/lib/runtime-paths.conf" ]]; then
+  PYTHON3_BIN="$(sed -n 's/^python3=//p' "$TARGET/lib/runtime-paths.conf" | head -1)"
+fi
+if [[ -z "$PYTHON3_BIN" || ! -x "$PYTHON3_BIN" ]]; then
+  PYTHON3_BIN="$(command -v python3)"
+fi
+
+"$PYTHON3_BIN" -I -S "$MANAGER" deconfigure "$HOME" "$TARGET"
 
 for skill in "$HOME/.claude/skills/elixir-debug" "$HOME/.agents/skills/elixir-debug"; do
   if [[ -f "$skill/.elixir-agent-debug-managed" ]]; then

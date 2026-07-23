@@ -7,7 +7,8 @@ from pathlib import Path
 import re
 import shutil
 import shlex
-from typing import Dict, Iterable, Optional, Tuple
+import sys
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 BEGIN = "<!-- elixir-agent-debug:begin -->"
 END = "<!-- elixir-agent-debug:end -->"
@@ -108,8 +109,8 @@ def add_hook(path, command):
     write_json(path, data)
 
 
-def remove_hook(path, command):
-    # type: (Path, str) -> None
+def remove_hooks_matching(path, predicate):
+    # type: (Path, Callable[[str], bool]) -> None
     if not path.exists():
         return
     data = load_json(path)
@@ -129,7 +130,11 @@ def remove_hook(path, command):
         kept_hooks = [
             hook
             for hook in entry["hooks"]
-            if not (isinstance(hook, dict) and hook.get("command") == command)
+            if not (
+                isinstance(hook, dict)
+                and isinstance(hook.get("command"), str)
+                and predicate(hook["command"])
+            )
         ]
         if len(kept_hooks) != len(entry["hooks"]):
             changed = True
@@ -149,16 +154,31 @@ def remove_hook(path, command):
     write_json(path, data)
 
 
+def remove_hook(path, command):
+    # type: (Path, str) -> None
+    remove_hooks_matching(path, lambda value: value == command)
+
+
+def remove_hooks_referencing(path, fragment):
+    # type: (Path, str) -> None
+    # Every historical hook-command form — legacy plain `python3`, relative
+    # `python3 -I -S`, and any earlier absolute-interpreter form — mentions
+    # the package's stop_guard.py path, so removing by that fragment migrates
+    # them all without touching unrelated hooks.
+    remove_hooks_matching(path, lambda value: fragment in value)
+
+
 def hook_commands(target):
     # type: (Path) -> Tuple[str, str]
-    # The isolated form plus the legacy pre-1.4.3 form. `-I` ignores
-    # PYTHONPATH and user site-packages, `-S` skips sitecustomize: without
-    # them, a project environment could inject code into the hook process or
-    # corrupt the scripts' stdout protocols. Every install and removal
-    # handles both forms so an upgrade never leaves the legacy entry firing
-    # beside the isolated one.
+    # The hook command pins both layers of binary resolution: the interpreter
+    # is the absolute path of the Python running this installer (recorded at
+    # install time, when PATH is trusted), and `-I -S` isolates it after
+    # start (no PYTHONPATH, no user site-packages, no sitecustomize). Without
+    # the absolute path, a project-prepended PATH could substitute python3
+    # itself under the Stop hook. Returns the command plus the quoted script
+    # path, the fragment every historical command form contains.
     script = shlex.quote(str(target / "hooks" / "stop_guard.py"))
-    return "python3 -I -S " + script, "python3 " + script
+    return shlex.quote(sys.executable) + " -I -S " + script, script
 
 
 def configure(home, target, claude, codex, hooks, remove_hooks=False):
@@ -166,31 +186,29 @@ def configure(home, target, claude, codex, hooks, remove_hooks=False):
     # Selection is additive: configuring one client neither removes the other
     # client's integration nor an already-installed hook. Removal is explicit,
     # via --remove-hooks here or a full deconfigure.
-    command, legacy = hook_commands(target)
+    command, script = hook_commands(target)
     if claude:
         add_block(home / ".claude" / "CLAUDE.md", target / "adapters" / "claude-instructions.md")
         if hooks:
-            remove_hook(home / ".claude" / "settings.json", legacy)
+            remove_hooks_referencing(home / ".claude" / "settings.json", script)
             add_hook(home / ".claude" / "settings.json", command)
     if codex:
         add_block(home / ".codex" / "AGENTS.md", target / "adapters" / "codex-instructions.md")
         if hooks:
-            remove_hook(home / ".codex" / "hooks.json", legacy)
+            remove_hooks_referencing(home / ".codex" / "hooks.json", script)
             add_hook(home / ".codex" / "hooks.json", command)
     if remove_hooks:
         for path in (home / ".claude" / "settings.json", home / ".codex" / "hooks.json"):
-            remove_hook(path, command)
-            remove_hook(path, legacy)
+            remove_hooks_referencing(path, script)
 
 
 def deconfigure(home, target):
     # type: (Path, Path) -> None
-    command, legacy = hook_commands(target)
+    _command, script = hook_commands(target)
     remove_block(home / ".claude" / "CLAUDE.md")
     remove_block(home / ".codex" / "AGENTS.md")
     for path in (home / ".claude" / "settings.json", home / ".codex" / "hooks.json"):
-        remove_hook(path, command)
-        remove_hook(path, legacy)
+        remove_hooks_referencing(path, script)
 
 
 def main():
