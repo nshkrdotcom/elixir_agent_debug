@@ -132,6 +132,7 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
   printf 'Note: add %s to PATH for the beam-debug command.\n' "$HOME/.local/bin"
 fi
 if [[ "$WITH_HOOKS" -eq 1 && "$INSTALL_CODEX" -eq 1 ]]; then
-  printf 'Codex: open /hooks and trust the new user hook before it can run.\n'
+  printf 'Codex only: inside a Codex CLI session, run /hooks once and trust the new hook; Claude Code needs no such step.\n'
 fi
-printf 'Start a new CLI session, then run: beam-debug doctor\n'
+printf 'Start new agent CLI sessions to pick up the changes.\n'
+printf 'Then verify the install from any shell: beam-debug doctor\n'
