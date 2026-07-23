@@ -131,7 +131,7 @@ floor_satisfied() {
 # and missing or non-version values.
 manifest_floor() {
   need python3
-  python3 "$ROOT/lib/project_manifest.py" "$1"
+  python3 -I -S "$ROOT/lib/project_manifest.py" "$1"
 }
 
 require_project_floor() {
@@ -160,25 +160,31 @@ init_project() {
   local manifest="$root/.beam-debug.toml"
   if [[ -f "$manifest" ]]; then
     # Refreshing the notes with an older template would silently downgrade
-    # the project guidance: initialize-only when the floor is not met.
+    # the project guidance: rewrite only when this install provably meets the
+    # project's floor. A disabled floor proves nothing, so it also refuses.
     local minimum
     minimum="$(manifest_floor "$manifest")" || exit 3
-    if [[ -n "$minimum" ]] && ! floor_satisfied "$minimum"; then
+    if [[ -z "$minimum" ]]; then
+      printf 'beam-debug init-project: %s disables the version floor, so template compatibility cannot be verified.\n' \
+        "$manifest" >&2
+      printf 'Set `enabled = true` (or remove the manifest) and rerun.\n' >&2
+      exit 3
+    fi
+    if ! floor_satisfied "$minimum"; then
       printf 'beam-debug init-project: this project already requires >= %s; installed is %s.\n' \
         "$minimum" "$PACKAGE_VERSION" >&2
       printf 'Refusing to rewrite the project notes with an older template. Upgrade first:\n' >&2
       printf 'pull the latest elixir-agent-debug and rerun ./install.sh\n' >&2
       exit 3
     fi
-    printf 'Manifest already present: %s (minimum_version %s)\n' \
-      "$manifest" "${minimum:-disabled}"
+    printf 'Manifest already present: %s (minimum_version %s)\n' "$manifest" "$minimum"
   else
     printf 'enabled = true\nminimum_version = "%s"\n' "$PACKAGE_VERSION" > "$manifest"
     printf 'Wrote %s (minimum_version = "%s")\n' "$manifest" "$PACKAGE_VERSION"
   fi
 
-  python3 "$MANAGER" block-add "$root/CLAUDE.md" "$ROOT/adapters/project-instructions.md"
-  python3 "$MANAGER" block-add "$root/AGENTS.md" "$ROOT/adapters/project-instructions.md"
+  python3 -I -S "$MANAGER" block-add "$root/CLAUDE.md" "$ROOT/adapters/project-instructions.md"
+  python3 -I -S "$MANAGER" block-add "$root/AGENTS.md" "$ROOT/adapters/project-instructions.md"
   printf 'Added the project note to %s and %s (idempotent; safe to rerun).\n' \
     "$root/CLAUDE.md" "$root/AGENTS.md"
   printf 'Commit .beam-debug.toml, CLAUDE.md and AGENTS.md to share this with the team.\n'
@@ -225,7 +231,10 @@ doctor() {
       printf 'FAIL: %s\n' "$floor_out"
       failed=1
     elif [[ -z "$floor_out" ]]; then
-      printf 'note: project manifest present but disabled: %s\n' "$manifest"
+      # An explicit ok-line: the checked-in project note tells agents not to
+      # proceed without an `ok: project floor ...` result, and a deliberately
+      # disabled floor is a passing state, not a missing one.
+      printf 'ok: project floor disabled by manifest (%s)\n' "$manifest"
     elif floor_satisfied "$floor_out"; then
       printf 'ok: project floor %s (installed %s)\n' "$floor_out" "$PACKAGE_VERSION"
     else
@@ -429,23 +438,23 @@ case "$command" in
     ;;
   note|history|report)
     need python3
-    exec python3 "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
+    exec python3 -I -S "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
     ;;
   begin)
     need python3
-    exec python3 "$GUARD" --begin "$@"
+    exec python3 -I -S "$GUARD" --begin "$@"
     ;;
   end)
     need python3
-    exec python3 "$GUARD" --end "$@"
+    exec python3 -I -S "$GUARD" --end "$@"
     ;;
   scan)
     need python3
-    exec python3 "$GUARD" --scan
+    exec python3 -I -S "$GUARD" --scan
     ;;
   assert-clean)
     need python3
-    exec python3 "$GUARD" --assert-clean
+    exec python3 -I -S "$GUARD" --assert-clean
     ;;
   help|-h|--help)
     usage

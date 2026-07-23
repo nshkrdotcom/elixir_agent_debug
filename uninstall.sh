@@ -13,7 +13,7 @@ else
   exit 1
 fi
 
-python3 "$MANAGER" deconfigure "$HOME" "$TARGET"
+python3 -I -S "$MANAGER" deconfigure "$HOME" "$TARGET"
 
 for skill in "$HOME/.claude/skills/elixir-debug" "$HOME/.agents/skills/elixir-debug"; do
   if [[ -f "$skill/.elixir-agent-debug-managed" ]]; then

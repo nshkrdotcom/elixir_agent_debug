@@ -57,7 +57,7 @@ ELIXIR
 git -C "$repo" add sample.ex old_marker.ex
 git -C "$repo" commit -qm baseline
 
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean) \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --assert-clean) \
   || fail 'committed markers should not trigger the changed-line guard'
 
 cat > "$repo/sample.ex" <<'ELIXIR'
@@ -68,32 +68,32 @@ defmodule Sample do
 end
 ELIXIR
 
-if (cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null 2>&1); then
+if (cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null 2>&1); then
   fail 'assert-clean did not detect a newly-added marker'
 fi
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.ex:3') \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.ex:3') \
   || fail 'scan did not report expected line'
 
 # The hook must fail open on a generic marker: no session ledger, no block —
 # a global worktree scan cannot tell this session's instrumentation from
 # another agent's active work or committed fixtures.
 hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook acted without a session ledger: $hook_out"
 
 # ... and with no session metadata at all.
 hook_out="$(printf '{"cwd":"%s","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook did not fail open without session metadata: $hook_out"
 
 git -C "$repo" checkout -q -- sample.ex
 
 printf 'Checking session-owned Stop-hook semantics...\n'
-token="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" \
+token="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
   --begin --session-id sess-abc | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
 [[ -n "$token" ]] || fail 'begin did not print a marker token'
 
-token_again="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" \
+token_again="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
   --begin --session-id sess-abc | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
 [[ "$token" == "$token_again" ]] || fail 'begin was not idempotent for the same session'
 
@@ -107,7 +107,7 @@ ELIXIR
 
 # The owning session is blocked once, and the reason names only its token.
 hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 python3 - "$hook_json" "$token" <<'PY'
 import json
 import sys
@@ -119,12 +119,12 @@ PY
 
 # A different session sees the same markers and is not blocked.
 hook_out="$(printf '{"cwd":"%s","session_id":"sess-other","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook blocked a session that owns no markers: $hook_out"
 
 # The second stop of the owning session is allowed with a warning: no loop.
 hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":true}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 python3 - "$hook_json" <<'PY'
 import json
 import sys
@@ -135,7 +135,7 @@ PY
 
 # end refuses while owned markers remain, names the token workflow, then
 # succeeds after removal.
-end_out="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" 2>&1)" \
+end_out="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$token" 2>&1)" \
   && fail 'end succeeded while owned markers remained'
 printf '%s' "$end_out" | grep -q "beam-debug end $token" \
   || fail "end did not point back at itself: $end_out"
@@ -145,7 +145,7 @@ printf '%s' "$end_out" | grep -q "beam-debug end $token" \
 git -C "$repo" add sample.ex
 git -C "$repo" commit -qm 'accidentally committed instrumentation'
 hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 python3 - "$hook_json" "$token" <<'PY'
 import json
 import sys
@@ -154,21 +154,21 @@ assert value["decision"] == "block", value
 assert "sample.ex:3" in value["reason"], value
 assert "BEAMDBG:" + sys.argv[2] in value["reason"], value
 PY
-if (cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null 2>&1); then
+if (cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null 2>&1); then
   fail 'end missed a committed owned marker'
 fi
 # The whole-worktree audit stays newly-added-lines-only: the committed marker
 # must not fail it.
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean) \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --assert-clean) \
   || fail 'assert-clean flagged committed content'
 
 git -C "$repo" revert --no-edit HEAD >/dev/null
-(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null) \
+(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null) \
   || fail 'end failed after markers were removed'
 
 # With the ledger retired the hook is inert again for that session.
 hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
-  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
 [[ -z "$hook_out" ]] || fail "hook still active after end: $hook_out"
 
 printf 'Checking Erlang marker coverage (unstaged, staged, untracked)...\n'
@@ -187,11 +187,11 @@ value() ->
     io:format("BEAMDBG value ~p~n", [ok]), % BEAMDBG
     ok.
 ERLANG
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
   || fail 'scan did not report an unstaged Erlang marker'
 
 git -C "$repo" add sample.erl
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
   || fail 'scan did not report a staged Erlang marker'
 git -C "$repo" checkout -q HEAD -- sample.erl
 
@@ -199,13 +199,13 @@ cat > "$repo/probe.hrl" <<'ERLANG'
 %% BEAMDBG probe macro
 -define(PROBE, beamdbg).
 ERLANG
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'probe.hrl:1') \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --scan | grep -q 'probe.hrl:1') \
   || fail 'scan did not report an untracked Erlang header marker'
-if (cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null 2>&1); then
+if (cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null 2>&1); then
   fail 'assert-clean passed while Erlang markers remained'
 fi
 rm -f "$repo/probe.hrl"
-(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null) \
+(cd "$repo" && python3 -I -S "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null) \
   || fail 'assert-clean failed after Erlang markers were removed'
 
 printf 'Checking isolated install, idempotence, JSON preservation, capture, and uninstall...\n'
@@ -215,28 +215,33 @@ export ELIXIR_AGENT_DEBUG_HOME="$HOME/.local/share/elixir-agent-debug"
 mkdir -p "$HOME/.claude" "$HOME/.codex"
 printf '# Existing Claude preference\n' > "$HOME/.claude/CLAUDE.md"
 printf '# Existing Codex preference\n' > "$HOME/.codex/AGENTS.md"
-cat > "$HOME/.claude/settings.json" <<'JSON'
+# Each config carries an unrelated hook that must survive, plus a legacy
+# pre-1.4.3 package hook (plain python3) that the upgrade must migrate to the
+# isolated form instead of leaving a second entry firing beside it.
+cat > "$HOME/.claude/settings.json" <<JSON
 {
   "theme": "existing",
   "hooks": {
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "echo existing-claude"}
+          {"type": "command", "command": "echo existing-claude"},
+          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
         ]
       }
     ]
   }
 }
 JSON
-cat > "$HOME/.codex/hooks.json" <<'JSON'
+cat > "$HOME/.codex/hooks.json" <<JSON
 {
   "description": "existing",
   "hooks": {
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "echo existing-codex"}
+          {"type": "command", "command": "echo existing-codex"},
+          {"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}
         ]
       }
     ]
@@ -269,7 +274,10 @@ for index, name in enumerate(sys.argv[1:]):
     entries = data["hooks"]["Stop"]
     commands = [hook["command"] for entry in entries for hook in entry["hooks"]]
     package = [value for value in commands if "elixir-agent-debug/hooks/stop_guard.py" in value]
+    # Exactly one package hook: the legacy plain-python3 entry must have been
+    # migrated, not joined, and the survivor runs isolated Python.
     assert len(package) == 1, (name, package)
+    assert package[0].startswith("python3 -I -S "), (name, package)
     assert expected_existing[index] in commands, (name, commands)
 PY
 
@@ -394,6 +402,15 @@ BADCASES
   printf 'enabled = false\n' > "$repo/.beam-debug.toml"
   (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
     || fail 'enabled = false must disable the floor check'
+  # A disabled floor is a deliberate passing state: doctor reports it as an
+  # explicit ok-line (the project note requires one before proceeding), and
+  # init-project cannot verify template compatibility against it.
+  doctor_out="$( (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor) 2>&1 || true )"
+  printf '%s' "$doctor_out" | grep -q 'ok: project floor disabled by manifest' \
+    || fail "doctor must report a disabled floor as an ok line: $doctor_out"
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
+    fail 'init-project must not rewrite notes while the floor is disabled'
+  fi
   printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
   (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
     || fail 'a satisfied floor must not block commands'

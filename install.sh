@@ -125,7 +125,7 @@ fi
 if [[ "$REMOVE_HOOKS" -eq 1 ]]; then
   manager_args+=(--remove-hooks)
 fi
-python3 "$MANAGER" "${manager_args[@]}"
+python3 -I -S "$MANAGER" "${manager_args[@]}"
 
 printf 'Installed elixir-agent-debug at %s\n' "$TARGET"
 printf 'Command: %s\n' "$HOME/.local/bin/beam-debug"

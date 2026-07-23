@@ -167,7 +167,11 @@ Version skew then resolves one way, deliberately:
   instructions must never direct an agent to modify user-level
   configuration on its own;
 - want the check gone temporarily → set `enabled = false` in the manifest,
-  or delete the file. Anything else fails closed: the manifest is validated
+  or delete the file. A disabled floor is a deliberate passing state:
+  `doctor` reports it as an explicit `ok: project floor disabled by
+  manifest` line, and `init-project` refuses to refresh the project notes
+  while it cannot verify template compatibility against a floor. Anything
+  else fails closed: the manifest is validated
   by a strict TOML parse (Python's `tomllib`), so invalid TOML, duplicate
   keys, a quoted `"true"` where a boolean belongs, unknown keys, missing
   required keys and non-version values are all errors — never a silently
@@ -500,7 +504,13 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
 - fails open — no session metadata, no repository, no ledger, no owned entry,
   or any internal error all mean the stop proceeds silently; it never falls
   back to a global scan;
-- never edits source files itself.
+- never edits source files itself;
+- runs isolated Python (`python3 -I -S`, like every package-owned Python
+  process): the interpreter ignores `PYTHONPATH`, user site-packages and
+  `sitecustomize`, so a project environment cannot inject code into the hook
+  or corrupt the scripts' output protocols. Upgrading with `--hooks`
+  migrates a legacy plain-`python3` hook entry to the isolated form rather
+  than leaving both installed.
 
 On Codex, session metadata in hook payloads is less established; when the
 expected fields are absent the hook simply stays inert, and `assert-clean`
