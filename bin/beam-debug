@@ -48,6 +48,16 @@ Observe without editing source:
                                      --top N           (default 10, by queue
                                                         length)
 
+Temporary inline markers (Elixir `# BEAMDBG`, Erlang `% BEAMDBG`):
+  begin                       Start a session-owned marker ledger; prints the
+                              token to embed in markers (# BEAMDBG:<token>).
+                              An installed Stop hook checks only markers
+                              owned by its own agent session.
+  end [token]                 Verify this session's markers are gone, then
+                              drop the ledger entry
+  scan                        List all newly-added BEAMDBG markers
+  assert-clean                Exit nonzero when newly-added markers remain
+
 Evidence journal (optional, per repository):
   note <text> [--status open|confirmed|killed] [--evidence TEXT]
   history [--limit N]         Print journal entries, newest last
@@ -58,8 +68,6 @@ Other:
   iex [mix-args...]           Run `iex -S mix ...` with helpers preloaded
   capture -- <command...>     Run inline and tee output to a per-repo latest.log
   latest                      Print the latest captured log for this repo
-  scan                        List newly-added `# BEAMDBG` markers
-  assert-clean                Exit nonzero when newly-added markers remain
   help                        Show this help
 USAGE
 }
@@ -297,6 +305,14 @@ case "$command" in
   note|history|report)
     need python3
     exec python3 "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
+    ;;
+  begin)
+    need python3
+    exec python3 "$GUARD" --begin "$@"
+    ;;
+  end)
+    need python3
+    exec python3 "$GUARD" --end "$@"
     ;;
   scan)
     need python3

@@ -36,7 +36,8 @@ fi
 printf 'Checking marker scanner and Stop-hook output...\n'
 repo="$(mktemp -d)"
 home="$(mktemp -d)"
-trap 'rm -rf -- "$repo" "$home"' EXIT
+state="$(mktemp -d)"
+trap 'rm -rf -- "$repo" "$home" "$state"' EXIT
 
 git -C "$repo" init -q
 git -C "$repo" config user.email smoke@example.invalid
@@ -72,16 +73,114 @@ fi
 (cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.ex:3') \
   || fail 'scan did not report expected line'
 
-hook_json="$(printf '{"cwd":"%s","stop_hook_active":false}' "$repo" | python3 "$ROOT/hooks/stop_guard.py")"
-python3 - "$hook_json" <<'PY'
+# The hook must fail open on a generic marker: no session ledger, no block —
+# a global worktree scan cannot tell this session's instrumentation from
+# another agent's active work or committed fixtures.
+hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook acted without a session ledger: $hook_out"
+
+# ... and with no session metadata at all.
+hook_out="$(printf '{"cwd":"%s","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook did not fail open without session metadata: $hook_out"
+
+git -C "$repo" checkout -q -- sample.ex
+
+printf 'Checking session-owned Stop-hook semantics...\n'
+token="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-abc | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
+[[ -n "$token" ]] || fail 'begin did not print a marker token'
+
+token_again="$(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-abc | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
+[[ "$token" == "$token_again" ]] || fail 'begin was not idempotent for the same session'
+
+cat > "$repo/sample.ex" <<ELIXIR
+defmodule Sample do
+  def value do
+    IO.inspect(:ok, label: "BEAMDBG value") # BEAMDBG:$token
+  end
+end
+ELIXIR
+
+# The owning session is blocked once, and the reason names only its token.
+hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+python3 - "$hook_json" "$token" <<'PY'
 import json
 import sys
 value = json.loads(sys.argv[1])
 assert value["decision"] == "block", value
 assert "sample.ex:3" in value["reason"], value
+assert "BEAMDBG:" + sys.argv[2] in value["reason"], value
 PY
 
+# A different session sees the same markers and is not blocked.
+hook_out="$(printf '{"cwd":"%s","session_id":"sess-other","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook blocked a session that owns no markers: $hook_out"
+
+# The second stop of the owning session is allowed with a warning: no loop.
+hook_json="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":true}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+python3 - "$hook_json" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert "decision" not in value, value
+assert "systemMessage" in value, value
+PY
+
+# end refuses while owned markers remain, then succeeds after removal.
+if (cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null 2>&1); then
+  fail 'end succeeded while owned markers remained'
+fi
 git -C "$repo" checkout -q -- sample.ex
+(cd "$repo" && XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py" --end "$token" >/dev/null) \
+  || fail 'end failed after markers were removed'
+
+# With the ledger retired the hook is inert again for that session.
+hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook still active after end: $hook_out"
+
+printf 'Checking Erlang marker coverage (unstaged, staged, untracked)...\n'
+cat > "$repo/sample.erl" <<'ERLANG'
+-module(sample).
+-export([value/0]).
+value() -> ok.
+ERLANG
+git -C "$repo" add sample.erl
+git -C "$repo" commit -qm erlang-baseline
+
+cat > "$repo/sample.erl" <<'ERLANG'
+-module(sample).
+-export([value/0]).
+value() ->
+    io:format("BEAMDBG value ~p~n", [ok]), % BEAMDBG
+    ok.
+ERLANG
+(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
+  || fail 'scan did not report an unstaged Erlang marker'
+
+git -C "$repo" add sample.erl
+(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'sample.erl:4') \
+  || fail 'scan did not report a staged Erlang marker'
+git -C "$repo" checkout -q HEAD -- sample.erl
+
+cat > "$repo/probe.hrl" <<'ERLANG'
+%% BEAMDBG probe macro
+-define(PROBE, beamdbg).
+ERLANG
+(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --scan | grep -q 'probe.hrl:1') \
+  || fail 'scan did not report an untracked Erlang header marker'
+if (cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null 2>&1); then
+  fail 'assert-clean passed while Erlang markers remained'
+fi
+rm -f "$repo/probe.hrl"
+(cd "$repo" && python3 "$ROOT/hooks/stop_guard.py" --assert-clean >/dev/null) \
+  || fail 'assert-clean failed after Erlang markers were removed'
 
 printf 'Checking isolated install, idempotence, JSON preservation, capture, and uninstall...\n'
 export HOME="$home"
@@ -147,6 +246,22 @@ for index, name in enumerate(sys.argv[1:]):
     assert len(package) == 1, (name, package)
     assert expected_existing[index] in commands, (name, commands)
 PY
+
+"$ROOT/install.sh" --remove-hooks
+python3 - "$HOME/.claude/settings.json" "$HOME/.codex/hooks.json" <<'PY'
+import json
+import sys
+expected_existing = ["echo existing-claude", "echo existing-codex"]
+for index, name in enumerate(sys.argv[1:]):
+    with open(name, encoding="utf-8") as handle:
+        data = json.load(handle)
+    entries = data.get("hooks", {}).get("Stop", [])
+    commands = [hook["command"] for entry in entries for hook in entry["hooks"]]
+    package = [value for value in commands if "elixir-agent-debug/hooks/stop_guard.py" in value]
+    assert not package, (name, package)
+    assert expected_existing[index] in commands, (name, commands)
+PY
+"$ROOT/install.sh" --hooks
 
 "$HOME/.local/bin/beam-debug" help >/dev/null
 

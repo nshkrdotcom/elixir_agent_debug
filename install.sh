@@ -4,23 +4,31 @@ set -euo pipefail
 SOURCE_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${ELIXIR_AGENT_DEBUG_HOME:-$HOME/.local/share/elixir-agent-debug}"
 WITH_HOOKS=0
+REMOVE_HOOKS=0
 INSTALL_CLAUDE=1
 INSTALL_CODEX=1
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--hooks] [--claude-only|--codex-only]
+Usage: ./install.sh [--hooks|--remove-hooks] [--claude-only|--codex-only]
 
-  --hooks         Add a Stop hook that asks the agent once to remove newly-added
-                  # BEAMDBG markers before stopping
+  --hooks         Opt in to the session-owned Stop hook: it asks the agent
+                  once to remove marker lines that its own `beam-debug begin`
+                  session left behind, and does nothing in any other case
+  --remove-hooks  Remove a previously installed Stop hook from both clients
   --claude-only   Install only Claude Code integration
   --codex-only    Install only Codex CLI integration
+
+Selection is additive: installing for one client does not remove the other
+client's integration, and omitting --hooks does not remove an existing hook.
+Removal is always explicit (--remove-hooks or ./uninstall.sh).
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --hooks) WITH_HOOKS=1 ;;
+    --remove-hooks) REMOVE_HOOKS=1 ;;
     --claude-only) INSTALL_CLAUDE=1; INSTALL_CODEX=0 ;;
     --codex-only) INSTALL_CLAUDE=0; INSTALL_CODEX=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -28,6 +36,11 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ "$WITH_HOOKS" -eq 1 && "$REMOVE_HOOKS" -eq 1 ]]; then
+  printf 'install.sh: --hooks and --remove-hooks are mutually exclusive\n' >&2
+  exit 2
+fi
 
 for command in python3 cp mkdir rm readlink mktemp mv ln chmod; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -107,6 +120,9 @@ if [[ "$INSTALL_CODEX" -eq 1 ]]; then
 fi
 if [[ "$WITH_HOOKS" -eq 1 ]]; then
   manager_args+=(--hooks)
+fi
+if [[ "$REMOVE_HOOKS" -eq 1 ]]; then
+  manager_args+=(--remove-hooks)
 fi
 python3 "$MANAGER" "${manager_args[@]}"
 

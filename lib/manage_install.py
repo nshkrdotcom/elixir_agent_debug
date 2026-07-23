@@ -149,8 +149,11 @@ def remove_hook(path, command):
     write_json(path, data)
 
 
-def configure(home, target, claude, codex, hooks):
-    # type: (Path, Path, bool, bool, bool) -> None
+def configure(home, target, claude, codex, hooks, remove_hooks=False):
+    # type: (Path, Path, bool, bool, bool, bool) -> None
+    # Selection is additive: configuring one client neither removes the other
+    # client's integration nor an already-installed hook. Removal is explicit,
+    # via --remove-hooks here or a full deconfigure.
     command = "python3 " + shlex.quote(str(target / "hooks" / "stop_guard.py"))
     if claude:
         add_block(home / ".claude" / "CLAUDE.md", target / "adapters" / "claude-instructions.md")
@@ -160,6 +163,9 @@ def configure(home, target, claude, codex, hooks):
         add_block(home / ".codex" / "AGENTS.md", target / "adapters" / "codex-instructions.md")
         if hooks:
             add_hook(home / ".codex" / "hooks.json", command)
+    if remove_hooks:
+        remove_hook(home / ".claude" / "settings.json", command)
+        remove_hook(home / ".codex" / "hooks.json", command)
 
 
 def deconfigure(home, target):
@@ -197,6 +203,7 @@ def main():
     install.add_argument("--claude", action="store_true")
     install.add_argument("--codex", action="store_true")
     install.add_argument("--hooks", action="store_true")
+    install.add_argument("--remove-hooks", action="store_true")
 
     uninstall = sub.add_parser("deconfigure")
     uninstall.add_argument("home", type=Path)
@@ -214,7 +221,9 @@ def main():
     elif args.action == "configure":
         if not args.claude and not args.codex:
             parser.error("configure requires --claude and/or --codex")
-        configure(args.home, args.target, args.claude, args.codex, args.hooks)
+        if args.hooks and args.remove_hooks:
+            parser.error("--hooks and --remove-hooks are mutually exclusive")
+        configure(args.home, args.target, args.claude, args.codex, args.hooks, args.remove_hooks)
     elif args.action == "deconfigure":
         deconfigure(args.home, args.target)
     else:
