@@ -4,23 +4,50 @@ set -euo pipefail
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
 GUARD="$ROOT/hooks/stop_guard.py"
+JOURNAL="$ROOT/lib/journal.py"
 HELPER="$ROOT/support/beam_debug.exs"
+PROBE_TRACE="$ROOT/support/probe_trace.exs"
+PROBE_SNAPSHOT="$ROOT/support/probe_snapshot.exs"
 
 usage() {
   cat <<'USAGE'
 Usage: beam-debug <command> [args]
 
-Commands:
-  doctor                    Check the local install and BEAM toolchain
-  test [mix-test-args...]    Run `mix test --trace ...` inline
-  itest [mix-test-args...]   Run interactive `iex -S mix test --trace ...`
-                            with BeamDebug helpers preloaded
-  iex [mix-args...]          Run `iex -S mix ...` with helpers preloaded
-  capture -- <command...>    Run inline and tee output to a per-repo latest.log
-  latest                    Print the latest captured log for this repo
-  scan                      List newly-added `# BEAMDBG` markers
-  assert-clean              Exit nonzero when newly-added markers remain
-  help                      Show this help
+Run tests:
+  test [mix-test-args...]     Plain `mix test` passthrough (no implicit --trace)
+  pry-test [mix-test-args...] Interactive `iex -S mix test --trace` with helpers
+                              preloaded. --trace is added deliberately here: it
+                              disables test timeouts so IEx.pry is usable. It
+                              also sets --max-cases 1, so do not use it to
+                              investigate cross-test concurrency failures.
+
+Observe without editing source:
+  trace <target> [opts] [-- mix ...]
+                              Bounded :dbg call trace of an MFA target.
+                              target: Mod | Mod.fun | Mod.fun/arity
+                              opts:  --limit N (default 200 events)
+                                     --for MS  (also stop after MS ms)
+  snapshot [opts] [-- mix ...]
+                              Run a command with a watchdog that dumps process
+                              state, mailboxes, current stacktraces, links,
+                              monitors and supervisor children at a chosen time.
+                              opts:  --after MS   (default 5000)
+                                     --names A,B  (explicit registered names)
+                                     --top N      (default 10, by queue length)
+
+Evidence journal (per repository):
+  note <text> [--status open|confirmed|killed] [--evidence TEXT]
+  history [--limit N]         Print journal entries, newest last
+  report                      Group the journal into a report skeleton
+
+Other:
+  doctor                      Check the local install and BEAM toolchain
+  iex [mix-args...]           Run `iex -S mix ...` with helpers preloaded
+  capture -- <command...>     Run inline and tee output to a per-repo latest.log
+  latest                      Print the latest captured log for this repo
+  scan                        List newly-added `# BEAMDBG` markers
+  assert-clean                Exit nonzero when newly-added markers remain
+  help                        Show this help
 USAGE
 }
 
@@ -30,11 +57,15 @@ repo_identity() {
   printf '%s' "$root" | sha256sum | cut -c1-16
 }
 
-log_path() {
+state_dir() {
   local base key
   base="${XDG_STATE_HOME:-$HOME/.local/state}/beam-debug"
   key="$(repo_identity)"
-  printf '%s/%s/latest.log\n' "$base" "$key"
+  printf '%s/%s\n' "$base" "$key"
+}
+
+log_path() {
+  printf '%s/latest.log\n' "$(state_dir)"
 }
 
 need() {
@@ -74,7 +105,7 @@ doctor() {
 
   printf 'claude skill: %s\n' "$HOME/.claude/skills/elixir-debug/SKILL.md"
   printf 'codex skill:  %s\n' "$HOME/.agents/skills/elixir-debug/SKILL.md"
-  printf 'capture log:  %s\n' "$(log_path)"
+  printf 'state dir:    %s\n' "$(state_dir)"
 
   return "$failed"
 }
@@ -104,6 +135,78 @@ capture() {
   return "$status"
 }
 
+# Split "<opts...> [-- <command...>]" and run the command under a probe file.
+# Defaults to `mix test` when no explicit command is given.
+run_with_probe() {
+  local probe="$1"
+  shift
+  need elixir
+  need mix
+
+  local -a command=()
+  local seen_separator=0
+  for argument in "$@"; do
+    if [[ "$seen_separator" -eq 1 ]]; then
+      command+=("$argument")
+    elif [[ "$argument" == "--" ]]; then
+      seen_separator=1
+    fi
+  done
+  if [[ "${#command[@]}" -eq 0 ]]; then
+    command=(mix test)
+  fi
+  if [[ "${command[0]}" != "mix" ]]; then
+    printf 'beam-debug: the traced command must start with `mix` (got: %s)\n' "${command[0]}" >&2
+    exit 2
+  fi
+
+  exec elixir -r "$HELPER" -r "$probe" -S "${command[@]}"
+}
+
+trace() {
+  local target="" limit=200 duration=0
+  if [[ $# -eq 0 || "$1" == "--" || "$1" == --* ]]; then
+    printf 'beam-debug trace: missing target (Mod | Mod.fun | Mod.fun/arity)\n' >&2
+    exit 2
+  fi
+  target="$1"
+  shift
+
+  local -a rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="${2:?--limit needs a value}"; shift 2 ;;
+      --for) duration="${2:?--for needs a value}"; shift 2 ;;
+      --) rest=("$@"); break ;;
+      *) printf 'beam-debug trace: unknown option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+  done
+
+  export BEAM_DEBUG_TRACE_TARGET="$target"
+  export BEAM_DEBUG_TRACE_LIMIT="$limit"
+  export BEAM_DEBUG_TRACE_FOR="$duration"
+  run_with_probe "$PROBE_TRACE" "${rest[@]+"${rest[@]}"}"
+}
+
+snapshot() {
+  local after=5000 names="" top=10
+  local -a rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --after) after="${2:?--after needs a value}"; shift 2 ;;
+      --names) names="${2:?--names needs a value}"; shift 2 ;;
+      --top) top="${2:?--top needs a value}"; shift 2 ;;
+      --) rest=("$@"); break ;;
+      *) printf 'beam-debug snapshot: unknown option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+  done
+
+  export BEAM_DEBUG_SNAPSHOT_AFTER="$after"
+  export BEAM_DEBUG_SNAPSHOT_NAMES="$names"
+  export BEAM_DEBUG_SNAPSHOT_TOP="$top"
+  run_with_probe "$PROBE_SNAPSHOT" "${rest[@]+"${rest[@]}"}"
+}
+
 command="${1:-help}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -115,9 +218,15 @@ case "$command" in
     ;;
   test)
     need mix
-    exec mix test --trace "$@"
+    exec mix test "$@"
+    ;;
+  pry-test)
+    need iex
+    need mix
+    exec iex -r "$HELPER" -S mix test --trace "$@"
     ;;
   itest)
+    printf 'beam-debug: `itest` is renamed to `pry-test`; running pry-test.\n' >&2
     need iex
     need mix
     exec iex -r "$HELPER" -S mix test --trace "$@"
@@ -126,6 +235,12 @@ case "$command" in
     need iex
     need mix
     exec iex -r "$HELPER" -S mix "$@"
+    ;;
+  trace)
+    trace "$@"
+    ;;
+  snapshot)
+    snapshot "$@"
     ;;
   capture)
     capture "$@"
@@ -137,6 +252,10 @@ case "$command" in
       exit 1
     fi
     cat -- "$file"
+    ;;
+  note|history|report)
+    need python3
+    exec python3 "$JOURNAL" "$command" --state-dir "$(state_dir)" "$@"
     ;;
   scan)
     need python3

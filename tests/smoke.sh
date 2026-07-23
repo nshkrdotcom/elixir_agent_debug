@@ -10,7 +10,25 @@ fail() {
 
 printf 'Checking syntax...\n'
 bash -n "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/bin/beam-debug" "$ROOT/tests/smoke.sh"
-python3 -m py_compile "$ROOT/hooks/stop_guard.py" "$ROOT/lib/manage_install.py"
+python3 -m py_compile "$ROOT/hooks/stop_guard.py" "$ROOT/lib/manage_install.py" "$ROOT/lib/journal.py"
+
+printf 'Checking that test runs are not silently serialized...\n'
+grep -q 'exec mix test "\$@"' "$ROOT/bin/beam-debug" \
+  || fail '`beam-debug test` must be a plain mix test passthrough (no implicit --trace)'
+grep -q 'exec iex -r "\$HELPER" -S mix test --trace' "$ROOT/bin/beam-debug" \
+  || fail '`beam-debug pry-test` must keep --trace'
+
+printf 'Checking Elixir helper and probe syntax...\n'
+if command -v elixirc >/dev/null 2>&1; then
+  probe_out="$(mktemp -d)"
+  for source in "$ROOT/support/beam_debug.exs"; do
+    (cd "$probe_out" && elixirc "$source" >/dev/null) \
+      || fail "failed to compile $source"
+  done
+  rm -rf -- "$probe_out"
+else
+  printf 'note: elixirc not available; skipped BEAM helper compilation.\n'
+fi
 
 printf 'Checking marker scanner and Stop-hook output...\n'
 repo="$(mktemp -d)"
@@ -128,6 +146,22 @@ for index, name in enumerate(sys.argv[1:]):
 PY
 
 "$HOME/.local/bin/beam-debug" help >/dev/null
+
+printf 'Checking argument validation and the evidence journal...\n'
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace >/dev/null 2>&1); then
+  fail 'trace without a target should be rejected'
+fi
+if (cd "$repo" && "$HOME/.local/bin/beam-debug" trace Foo --bogus >/dev/null 2>&1); then
+  fail 'trace should reject unknown options'
+fi
+(
+  cd "$repo"
+  "$HOME/.local/bin/beam-debug" note 'mailbox theory' --status killed --evidence 'trace shows 3 calls' >/dev/null
+  "$HOME/.local/bin/beam-debug" note 'ttl theory' --status confirmed >/dev/null
+  "$HOME/.local/bin/beam-debug" history | grep -q 'mailbox theory'
+) || fail 'journal note/history did not round-trip'
+(cd "$repo" && "$HOME/.local/bin/beam-debug" report | grep -q 'Ruled out by evidence (1)') \
+  || fail 'journal report did not group entries by status'
 set +e
 (
   cd "$repo"

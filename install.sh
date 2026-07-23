@@ -91,6 +91,7 @@ install_package
 chmod 0755 -- "$TARGET/bin/beam-debug"
 chmod 0755 -- "$TARGET/hooks/stop_guard.py"
 chmod 0755 -- "$TARGET/lib/manage_install.py"
+chmod 0755 -- "$TARGET/lib/journal.py"
 chmod 0755 -- "$TARGET/uninstall.sh"
 MANAGER="$TARGET/lib/manage_install.py"
 install_command
