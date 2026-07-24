@@ -15,8 +15,15 @@ from typing import Callable, Dict, Iterable, Optional, Tuple
 
 BEGIN = "<!-- elixir-agent-debug:begin -->"
 END = "<!-- elixir-agent-debug:end -->"
-BLOCK_RE = re.compile(
-    r"(?:\n?)" + re.escape(BEGIN) + r"\n.*?\n" + re.escape(END) + r"(?:\n?)",
+# The block itself, for in-place refresh; and the block plus exactly the one
+# separator newline the installer introduced, for removal. Every byte
+# outside the managed block belongs to the user and is preserved verbatim.
+BLOCK_INNER_RE = re.compile(
+    re.escape(BEGIN) + r"\n.*?\n" + re.escape(END),
+    flags=re.DOTALL,
+)
+BLOCK_WITH_SEP_RE = re.compile(
+    r"\n?" + re.escape(BEGIN) + r"\n.*?\n" + re.escape(END) + r"\n?",
     flags=re.DOTALL,
 )
 
@@ -55,10 +62,19 @@ def write_text_atomic(path, text, default_mode=0o644):
 def add_block(path, snippet_path):
     # type: (Path, Path) -> None
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    cleaned = BLOCK_RE.sub("\n", existing).rstrip()
     snippet = snippet_path.read_text(encoding="utf-8").strip()
     block = BEGIN + "\n" + snippet + "\n" + END
-    output = cleaned + "\n\n" + block + "\n" if cleaned else block + "\n"
+    if BLOCK_INNER_RE.search(existing):
+        # Refresh the block in place; unrelated content — including its
+        # whitespace, which can be meaningful in Markdown — stays verbatim.
+        output = BLOCK_INNER_RE.sub(lambda _match: block, existing, count=1)
+        if output == existing:
+            return
+    elif existing:
+        separator = "" if existing.endswith("\n") else "\n"
+        output = existing + separator + "\n" + block + "\n"
+    else:
+        output = block + "\n"
     write_text_atomic(path, output)
 
 
@@ -67,8 +83,11 @@ def remove_block(path):
     if not path.exists():
         return
     existing = path.read_text(encoding="utf-8")
-    output = BLOCK_RE.sub("\n", existing).strip()
-    write_text_atomic(path, output + "\n" if output else "")
+    if not BLOCK_INNER_RE.search(existing):
+        # No managed block: this file is not ours to rewrite, not even to
+        # normalize whitespace.
+        return
+    write_text_atomic(path, BLOCK_WITH_SEP_RE.sub("", existing))
 
 
 def load_json(path):
@@ -197,6 +216,29 @@ def remove_hooks_referencing(path, fragment):
     remove_hooks_matching(path, lambda value: fragment in value)
 
 
+def has_hook_referencing(path, fragment):
+    # type: (Path, str) -> bool
+    if not path.exists():
+        return False
+    try:
+        data = load_json(path)
+    except SystemExit:
+        # A config this tool refuses to modify also cannot be refreshed;
+        # a plain upgrade must not fail over it.
+        return False
+    hooks_obj = data.get("hooks")
+    if not isinstance(hooks_obj, dict):
+        return False
+    stop_entries = hooks_obj.get("Stop")
+    if not isinstance(stop_entries, list):
+        return False
+    for entry in stop_entries:
+        for command in iter_hook_commands(entry) or ():
+            if fragment in command:
+                return True
+    return False
+
+
 def hook_commands(target):
     # type: (Path) -> Tuple[str, str]
     # The hook command pins both layers of binary resolution: the interpreter
@@ -214,18 +256,23 @@ def configure(home, target, claude, codex, hooks, remove_hooks=False):
     # type: (Path, Path, bool, bool, bool, bool) -> None
     # Selection is additive: configuring one client neither removes the other
     # client's integration nor an already-installed hook. Removal is explicit,
-    # via --remove-hooks here or a full deconfigure.
+    # via --remove-hooks here or a full deconfigure. A plain upgrade (no hook
+    # option) never newly opts a client in, but it does refresh an existing
+    # package hook to the current command form — a user who opted in once
+    # must not keep an obsolete or less-hardened hook command just because
+    # they omitted --hooks when upgrading.
     command, script = hook_commands(target)
+    clients = []
     if claude:
         add_block(home / ".claude" / "CLAUDE.md", target / "adapters" / "claude-instructions.md")
-        if hooks:
-            remove_hooks_referencing(home / ".claude" / "settings.json", script)
-            add_hook(home / ".claude" / "settings.json", command)
+        clients.append(home / ".claude" / "settings.json")
     if codex:
         add_block(home / ".codex" / "AGENTS.md", target / "adapters" / "codex-instructions.md")
-        if hooks:
-            remove_hooks_referencing(home / ".codex" / "hooks.json", script)
-            add_hook(home / ".codex" / "hooks.json", command)
+        clients.append(home / ".codex" / "hooks.json")
+    for path in clients:
+        if hooks or (not remove_hooks and has_hook_referencing(path, script)):
+            remove_hooks_referencing(path, script)
+            add_hook(path, command)
     if remove_hooks:
         for path in (home / ".claude" / "settings.json", home / ".codex" / "hooks.json"):
             remove_hooks_referencing(path, script)

@@ -21,7 +21,10 @@ Usage: ./install.sh [--hooks|--remove-hooks] [--claude-only|--codex-only]
 
 Selection is additive: installing for one client does not remove the other
 client's integration, and omitting --hooks does not remove an existing hook.
-Removal is always explicit (--remove-hooks or ./uninstall.sh).
+An upgrade without --hooks never newly opts a client in, but it refreshes an
+already-installed package hook to the current command form, so an opted-in
+hook stays current across upgrades. Removal is always explicit
+(--remove-hooks or ./uninstall.sh).
 USAGE
 }
 

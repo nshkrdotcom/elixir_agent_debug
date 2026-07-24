@@ -187,6 +187,14 @@ require_project_floor() {
 init_project() {
   need_git
   need_python3
+  # An enabled manifest fails every command closed when the interpreter
+  # cannot validate it, so refuse to create that state in the first place.
+  if ! "$PYTHON3_BIN" -I -S -c 'import tomllib' >/dev/null 2>&1; then
+    printf 'beam-debug init-project: %s lacks tomllib (Python >= 3.11 required).\n' "$PYTHON3_BIN" >&2
+    printf 'A manifest written now could not be validated and every beam-debug command\n' >&2
+    printf 'in this project would fail closed. Upgrade Python first, then rerun.\n' >&2
+    exit 4
+  fi
   local root
   root="$("$GIT_BIN" rev-parse --show-toplevel 2>/dev/null)" || {
     printf 'beam-debug init-project: not inside a git worktree.\n' >&2
@@ -245,6 +253,11 @@ doctor() {
   printf 'trusted git: %s\n' "${GIT_BIN:-<not found>}"
   if [[ ! -r "$RUNTIME_CONF" ]]; then
     printf 'note: no runtime-paths.conf (running from a checkout?); binaries resolve via PATH.\n'
+  fi
+  if [[ -n "$PYTHON3_BIN" ]] && "$PYTHON3_BIN" -I -S -c 'import tomllib' >/dev/null 2>&1; then
+    printf 'ok: tomllib     project-manifest validation available\n'
+  else
+    printf 'note: python3 lacks tomllib (Python >= 3.11); project manifests would fail closed and init-project refuses to create one.\n'
   fi
 
   for command in bash python3 git sha256sum; do

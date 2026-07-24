@@ -97,7 +97,10 @@ the whole-worktree audit, for when you ask for one.
 the default: a Stop hook runs at the end of *every* session in every
 repository, so it must be — and now is — inert unless the stopping session
 itself started a marker session. `--remove-hooks` removes a previously
-installed hook from both clients.
+installed hook from both clients. Upgrading without `--hooks` never newly
+opts a client in, but it does refresh an already-installed package hook to
+the current command form — opting in once is enough; later plain upgrades
+keep the hook's hardening current.
 
 Install for only one client:
 
@@ -192,6 +195,10 @@ Version skew then resolves one way, deliberately:
   required keys and non-version values are all errors — never a silently
   disabled check. Validation needs Python 3.11+; an older interpreter also
   fails closed, saying so.
+
+Manifest validation needs Python 3.11+ (`tomllib`); `init-project` refuses
+to create a manifest the recorded interpreter could not validate — every
+command would fail closed against it — and `doctor` reports the capability.
 
 Raise `minimum_version` by editing the manifest and committing, like any
 other project requirement. Rerunning `init-project` on an already-initialized

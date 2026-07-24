@@ -598,6 +598,27 @@ BADCASES
     || fail 'init-project refresh failed on a satisfied floor'
   grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" \
     || fail 'init-project refresh did not advance the floor to the installed version'
+
+  { (cd "$repo" && "$HOME/.local/bin/beam-debug" doctor) 2>/dev/null || true; } | grep -q 'ok: tomllib' \
+    || fail 'doctor does not report manifest-validation capability'
+
+  # init-project must refuse before writing anything when the recorded
+  # python3 cannot validate manifests: an enabled manifest would make every
+  # command in the project fail closed.
+  stub_dir="$(mktemp -d)"
+  printf '#!/bin/sh\nexit 1\n' > "$stub_dir/python3"
+  chmod +x "$stub_dir/python3"
+  target_conf="$ELIXIR_AGENT_DEBUG_HOME/lib/runtime-paths.conf"
+  cp -p "$target_conf" "$target_conf.smoke-save"
+  sed -i "s|^python3=.*|python3=$stub_dir/python3|" "$target_conf"
+  rm -f "$repo/.beam-debug.toml"
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
+    fail 'init-project succeeded although manifest validation is unavailable'
+  fi
+  [[ ! -e "$repo/.beam-debug.toml" ]] \
+    || fail 'init-project wrote a manifest it could not validate'
+  mv -f "$target_conf.smoke-save" "$target_conf"
+  rm -rf -- "$stub_dir"
 else
   printf 'note: python3 lacks tomllib (needs 3.11+); checking fail-closed behavior only.\n'
   (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null) \
@@ -637,5 +658,40 @@ rm -f "$HOME/.codex/hooks.json"
 [[ "$(stat -c %a "$HOME/.codex/hooks.json")" == "600" ]] \
   || fail "newly created hooks.json is not 0600: $(stat -c %a "$HOME/.codex/hooks.json")"
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh" >/dev/null
+
+printf 'Checking that a plain upgrade refreshes an existing hook without opting in...\n'
+cat > "$HOME/.claude/settings.json" <<JSON
+{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python3 $ELIXIR_AGENT_DEBUG_HOME/hooks/stop_guard.py"}]}
+    ]
+  }
+}
+JSON
+printf '{\n  "description": "no package hook"\n}\n' > "$HOME/.codex/hooks.json"
+"$ROOT/install.sh" >/dev/null
+python3 - "$HOME/.claude/settings.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+commands = [hook["command"] for entry in data["hooks"]["Stop"] for hook in entry["hooks"]]
+package = [value for value in commands if "stop_guard.py" in value]
+assert len(package) == 1, package
+assert package[0].startswith("/") and " -I -S " in package[0], package
+PY
+! grep -q 'stop_guard.py' "$HOME/.codex/hooks.json" \
+  || fail 'a plain install opted Codex into hooks'
+
+printf 'Checking unselected instruction files stay byte-identical...\n'
+printf '\n  KEEP LEADING\n\nTAIL   \n' > "$HOME/.codex/AGENTS.md"
+cp -p "$HOME/dotfiles/agents-md" "$HOME/agents-md.orig"
+"$ROOT/install.sh" --claude-only >/dev/null
+cmp -s "$HOME/dotfiles/agents-md" "$HOME/agents-md.orig" \
+  || fail 'a claude-only install modified the Codex AGENTS.md'
+"$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh" >/dev/null
+cmp -s "$HOME/dotfiles/agents-md" "$HOME/agents-md.orig" \
+  || fail 'uninstall rewrote a no-block AGENTS.md (whitespace must be preserved byte-for-byte)'
 
 printf 'PASS\n'
