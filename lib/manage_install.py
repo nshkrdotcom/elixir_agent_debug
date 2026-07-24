@@ -71,8 +71,11 @@ def add_block(path, snippet_path):
         if output == existing:
             return
     elif existing:
-        separator = "" if existing.endswith("\n") else "\n"
-        output = existing + separator + "\n" + block + "\n"
+        # Exactly one separator newline before the block, whatever the file
+        # ended with: removal strips exactly one back, so an add/remove
+        # cycle restores the original bytes even when the file had no final
+        # newline.
+        output = existing + "\n" + block + "\n"
     else:
         output = block + "\n"
     write_text_atomic(path, output)

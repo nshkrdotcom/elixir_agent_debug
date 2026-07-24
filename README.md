@@ -88,8 +88,10 @@ cd elixir-agent-debug
 ./install.sh
 ```
 
-The default install is instructions and tools only; it never edits either
-client's hook configuration. Cleanup is explicit through the agent-owned
+The default install is instructions and tools only; it never *newly enables*
+a hook (a package hook you previously opted into is refreshed to the current
+command form on upgrade — see below). Cleanup is explicit through the
+agent-owned
 `beam-debug begin` / `beam-debug end` cycle; `beam-debug assert-clean` is
 the whole-worktree audit, for when you ask for one.
 

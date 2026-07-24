@@ -620,13 +620,17 @@ BADCASES
   mv -f "$target_conf.smoke-save" "$target_conf"
   rm -rf -- "$stub_dir"
 else
-  printf 'note: python3 lacks tomllib (needs 3.11+); checking fail-closed behavior only.\n'
-  (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null) \
-    || fail 'init-project failed'
+  printf 'note: python3 lacks tomllib (needs 3.11+); checking refusal and fail-closed behavior only.\n'
+  if (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null 2>&1); then
+    fail 'init-project must refuse when manifests cannot be validated'
+  fi
+  [[ ! -e "$repo/.beam-debug.toml" ]] \
+    || fail 'init-project wrote a manifest it could not validate'
   printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
   if (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null 2>&1); then
     fail 'the floor must fail closed when tomllib is unavailable'
   fi
+  rm -f "$repo/.beam-debug.toml"
 fi
 
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh"
@@ -688,6 +692,19 @@ printf 'Checking unselected instruction files stay byte-identical...\n'
 printf '\n  KEEP LEADING\n\nTAIL   \n' > "$HOME/.codex/AGENTS.md"
 cp -p "$HOME/dotfiles/agents-md" "$HOME/agents-md.orig"
 "$ROOT/install.sh" --claude-only >/dev/null
+
+# An add/remove cycle must restore the original bytes even when the file
+# had no final newline.
+printf 'NO TRAILING NEWLINE' > "$HOME/no-newline.md"
+cp -p "$HOME/no-newline.md" "$HOME/no-newline.orig"
+python3 -I -S "$ELIXIR_AGENT_DEBUG_HOME/lib/manage_install.py" block-add \
+  "$HOME/no-newline.md" "$ELIXIR_AGENT_DEBUG_HOME/adapters/claude-instructions.md"
+grep -q 'elixir-agent-debug:begin' "$HOME/no-newline.md" \
+  || fail 'block-add did not add the block to a no-final-newline file'
+python3 -I -S "$ELIXIR_AGENT_DEBUG_HOME/lib/manage_install.py" block-remove "$HOME/no-newline.md"
+cmp -s "$HOME/no-newline.md" "$HOME/no-newline.orig" \
+  || fail 'add/remove did not restore a no-final-newline file byte-for-byte'
+
 cmp -s "$HOME/dotfiles/agents-md" "$HOME/agents-md.orig" \
   || fail 'a claude-only install modified the Codex AGENTS.md'
 "$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh" >/dev/null
