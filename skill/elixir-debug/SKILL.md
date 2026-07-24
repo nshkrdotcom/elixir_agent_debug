@@ -311,6 +311,13 @@ commits — and retires the session ledger. Do not run the whole-worktree
 someone else's instrumentation is not yours to clean. It exists for
 explicit, user-requested audits.
 
+When a broad test command or project script reports one or a few specific
+failing tests, use those exact tests as the inner debugging loop instead of
+rerunning the broad command after every edit. Return to the broader command
+after the focused failures pass. Do not narrow first when the symptom may
+depend on suite order, shared setup, concurrency, or interactions outside the
+reported test; preserve and reproduce those conditions before reducing scope.
+
 Then run the narrowest relevant regression test. If the failure was flaky, re-run
 with the recorded seed and `--repeat-until-failure`. Run broader tests only when
 scope and risk justify it.
