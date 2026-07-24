@@ -213,7 +213,16 @@ init_project() {
       printf 'pull the latest elixir-agent-debug and rerun ./install.sh\n' >&2
       exit 3
     fi
-    printf 'Manifest already present: %s (minimum_version %s)\n' "$manifest" "$minimum"
+    if [[ "$minimum" != "$PACKAGE_VERSION" ]]; then
+      # The refreshed notes use this version's template; the floor must rise
+      # with them, or an older version would still be allowed to overwrite
+      # them with its own older template later.
+      printf 'enabled = true\nminimum_version = "%s"\n' "$PACKAGE_VERSION" > "$manifest"
+      printf 'Advanced the version floor with the refreshed notes: %s -> %s\n' \
+        "$minimum" "$PACKAGE_VERSION"
+    else
+      printf 'Manifest already present: %s (minimum_version %s)\n' "$manifest" "$minimum"
+    fi
   else
     printf 'enabled = true\nminimum_version = "%s"\n' "$PACKAGE_VERSION" > "$manifest"
     printf 'Wrote %s (minimum_version = "%s")\n' "$manifest" "$PACKAGE_VERSION"
@@ -480,6 +489,10 @@ case "$command" in
       printf 'beam-debug: no captured log for this repository: %s\n' "$file" >&2
       exit 1
     fi
+    # Any access re-tightens legacy state written before the permission
+    # hardening; new files are created private.
+    chmod 0600 -- "$file" 2>/dev/null || true
+    chmod 0700 -- "$(dirname -- "$file")" "$(dirname -- "$(dirname -- "$file")")" 2>/dev/null || true
     cat -- "$file"
     ;;
   note|history|report)

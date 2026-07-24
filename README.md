@@ -108,7 +108,9 @@ Install for only one client:
 
 The installer is idempotent and only owns files or marked sections created by
 this package. It refuses to overwrite an unrelated skill or executable with
-the same name. Managed edits respect how you keep your dotfiles: a symlinked
+the same name, and it copies exactly the files listed in `MANIFEST.sha256` —
+local artifacts sitting in a source checkout (`_build`, `.env` files,
+editor droppings) are never installed. Managed edits respect how you keep your dotfiles: a symlinked
 `CLAUDE.md`, `AGENTS.md`, `settings.json` or `hooks.json` is updated through
 the link, never replaced by a regular file, and an existing file's mode is
 preserved (a private `0600` settings file stays `0600`; JSON configuration
@@ -174,8 +176,13 @@ Version skew then resolves one way, deliberately:
   project) and explicitly tells agents to stop and ask — repository
   instructions must never direct an agent to modify user-level
   configuration on its own;
-- want the check gone temporarily → set `enabled = false` in the manifest,
-  or delete the file. A disabled floor is a deliberate passing state:
+- want the check gone temporarily → set `enabled = false` in the manifest.
+  To stop using the package in a project entirely, remove `.beam-debug.toml`
+  **and** the managed `<!-- elixir-agent-debug -->` blocks from the project
+  `CLAUDE.md`/`AGENTS.md` in the same commit — the notes tell agents to
+  expect an `ok: project floor ...` result, so deleting only the manifest
+  leaves instructions that `doctor` can no longer satisfy. A disabled floor
+  is a deliberate passing state:
   `doctor` reports it as an explicit `ok: project floor disabled by
   manifest` line, and `init-project` refuses to refresh the project notes
   while it cannot verify template compatibility against a floor. Anything
@@ -187,7 +194,11 @@ Version skew then resolves one way, deliberately:
   fails closed, saying so.
 
 Raise `minimum_version` by editing the manifest and committing, like any
-other project requirement.
+other project requirement. Rerunning `init-project` on an already-initialized
+project (with a satisfied floor) refreshes the notes with the installed
+version's template **and advances the floor to that version** — the two move
+together, so an older installation can never quietly re-overwrite refreshed
+notes with its older template.
 
 What `init-project` deliberately does **not** do: install project-local
 skills, hooks, or executables. Project and user hooks *merge* in Claude Code
@@ -245,7 +256,9 @@ beyond what the diagnosis needs, and remember that `beam-debug capture`
 persists it to the state directory (`${XDG_STATE_HOME:-~/.local/state}/beam-debug/`),
 where it stays until you delete it. State directories are created `0700` and
 state files — capture logs, journals, marker ledgers — `0600`, so other
-local users cannot read them.
+local users cannot read them; files written by versions before this
+hardening are re-tightened whenever the tooling touches them (`history`,
+`report`, `latest`, `begin`/`end` and the hook all do this on access).
 
 ### Observe without editing the repository
 
@@ -296,6 +309,14 @@ events. Erlang modules use the `:mod`, `:mod.fun`, `:mod.fun/arity` form.
 Every trace is one session with a unique identity, and duration expiry,
 limit completion and explicit stops act on that session only — a stale timer
 from an earlier trace can never stop a later one.
+
+One legacy tracer at a time, for the whole session: tracers that exist
+before the trace starts are detected and refused (or taken over with
+`--replace-tracer`), but do not *start* another raw `:erlang.trace` or
+`:dbg` call trace while a BeamDebug trace is active — the legacy API has no
+tracer-scoped disable, so BeamDebug's shutdown clears legacy call-trace
+flags globally. The `:dbg` server process itself is never stopped by
+ordinary shutdown.
 
 `beam-debug snapshot` runs a command with a watchdog that fires at a
 wall-clock time you choose — measured from the start of the wrapped task,
@@ -525,9 +546,12 @@ the completion of tasks that never touched Elixir at all. The hook therefore:
   a project environment can neither substitute the binaries via a prepended
   `PATH` (direnv, venv, a repo `bin/`) nor inject code via
   `PYTHONPATH`/`sitecustomize`, and cannot corrupt the scripts' output
-  protocols. Upgrading with `--hooks` migrates every earlier hook-command
-  form (plain `python3`, PATH-resolved `python3 -I -S`, older absolute
-  paths) to one current entry. This no-injection guarantee is scoped to the
+  protocols. When the recorded `git` is missing or invalid, hook mode fails
+  open immediately instead of falling back to `PATH` (only explicitly
+  invoked commands like `scan` and `end` keep a `PATH` fallback, for
+  development checkouts). Upgrading with `--hooks` migrates every earlier
+  hook-command form (plain `python3`, PATH-resolved `python3 -I -S`, older
+  absolute paths) to one current entry. This no-injection guarantee is scoped to the
   automatic hook: the interactive `beam-debug` CLI prefers the same
   recorded binaries but still resolves ordinary shell utilities through
   `PATH`, and it exists to run the project's own toolchain (`mix`,

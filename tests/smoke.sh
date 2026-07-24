@@ -8,6 +8,24 @@ fail() {
   exit 1
 }
 
+# Hook mode requires a valid recorded git path (it never falls back to
+# PATH), so a development checkout needs a runtime-paths.conf for the direct
+# hook tests below. Create one if absent and clean it up on exit.
+CREATED_CONF=0
+if [[ ! -f "$ROOT/lib/runtime-paths.conf" ]]; then
+  printf 'python3=%s\ngit=%s\n' "$(command -v python3)" "$(command -v git)" \
+    > "$ROOT/lib/runtime-paths.conf"
+  CREATED_CONF=1
+fi
+cleanup_conf() {
+  if [[ -f "$ROOT/lib/runtime-paths.conf.smoke-save" ]]; then
+    mv -f -- "$ROOT/lib/runtime-paths.conf.smoke-save" "$ROOT/lib/runtime-paths.conf"
+  fi
+  if [[ "$CREATED_CONF" -eq 1 ]]; then
+    rm -f -- "$ROOT/lib/runtime-paths.conf"
+  fi
+}
+
 printf 'Checking syntax...\n'
 bash -n "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/bin/beam-debug" \
   "$ROOT/tests/smoke.sh" "$ROOT/tests/integration.sh"
@@ -38,7 +56,7 @@ printf 'Checking marker scanner and Stop-hook output...\n'
 repo="$(mktemp -d)"
 home="$(mktemp -d)"
 state="$(mktemp -d)"
-trap 'rm -rf -- "$repo" "$home" "$state"' EXIT
+trap 'rm -rf -- "$repo" "$home" "$state"; cleanup_conf' EXIT
 
 git -C "$repo" init -q
 git -C "$repo" config user.email smoke@example.invalid
@@ -116,6 +134,19 @@ assert value["decision"] == "block", value
 assert "sample.ex:3" in value["reason"], value
 assert "BEAMDBG:" + sys.argv[2] in value["reason"], value
 PY
+
+# With no valid recorded git, hook mode fails open instead of resolving git
+# through PATH — even with owned markers present and the owning session
+# stopping.
+mv "$ROOT/lib/runtime-paths.conf" "$ROOT/lib/runtime-paths.conf.smoke-save"
+hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook did not fail open without runtime-paths.conf: $hook_out"
+printf 'python3=%s\ngit=/nonexistent/git\n' "$(command -v python3)" > "$ROOT/lib/runtime-paths.conf"
+hook_out="$(printf '{"cwd":"%s","session_id":"sess-abc","stop_hook_active":false}' "$repo" \
+  | XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py")"
+[[ -z "$hook_out" ]] || fail "hook did not fail open with an invalid recorded git: $hook_out"
+mv -f "$ROOT/lib/runtime-paths.conf.smoke-save" "$ROOT/lib/runtime-paths.conf"
 
 # A different session sees the same markers and is not blocked.
 hook_out="$(printf '{"cwd":"%s","session_id":"sess-other","stop_hook_active":false}' "$repo" \
@@ -238,6 +269,17 @@ chmod 0755 -- "$sessions_dir"
 [[ "$(stat -c %a "$sessions_dir")" == "700" ]] \
   || fail "sessions directory was not re-tightened to 0700: $(stat -c %a "$sessions_dir")"
 
+# Any ledger *load* re-tightens legacy modes too — not only session reuse —
+# so end and the hook fix up pre-hardening files on access.
+chmod 0644 -- "$ledger_file"
+load_token="$(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" \
+  --begin --session-id sess-load | sed -n 's/.*# BEAMDBG:\([0-9a-f]\{8\}\).*/\1/p' | head -1)"
+[[ -n "$load_token" ]] || fail 'begin (load-path test) failed'
+[[ "$(stat -c %a "$ledger_file")" == "600" ]] \
+  || fail "ledger was not re-tightened on load: $(stat -c %a "$ledger_file")"
+(cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$load_token" >/dev/null) \
+  || fail 'could not retire the load-path ledger'
+
 (cd "$repo" && XDG_STATE_HOME="$state" python3 -I -S "$ROOT/hooks/stop_guard.py" --end "$ledger_token" >/dev/null) \
   || fail 'could not retire the permissions-test ledger'
 
@@ -336,8 +378,23 @@ mv "$HOME/.claude/settings.json" "$HOME/dotfiles/claude-settings.json"
 ln -s ../dotfiles/claude-settings.json "$HOME/.claude/settings.json"
 chmod 0600 "$HOME/dotfiles/claude-settings.json"
 
+# Local artifacts sitting beside the package source must never be installed:
+# the installer copies exactly the manifest's file list.
+touch "$ROOT/smoke-junk-artifact.tmp"
+
 "$ROOT/install.sh" --hooks
 "$ROOT/install.sh" --hooks
+
+rm -f "$ROOT/smoke-junk-artifact.tmp"
+[[ ! -e "$ELIXIR_AGENT_DEBUG_HOME/smoke-junk-artifact.tmp" ]] \
+  || fail 'installer copied an untracked artifact from the source checkout'
+while IFS= read -r installed_file; do
+  case "$installed_file" in
+    ./MANIFEST.sha256|./lib/runtime-paths.conf) continue ;;
+  esac
+  grep -qF "  $installed_file" "$ELIXIR_AGENT_DEBUG_HOME/MANIFEST.sha256" \
+    || fail "installed file is not in the manifest: $installed_file"
+done < <(cd "$ELIXIR_AGENT_DEBUG_HOME" && find . -type f | sort)
 
 for link in "$HOME/.claude/CLAUDE.md" "$HOME/.claude/settings.json" "$HOME/.codex/AGENTS.md"; do
   [[ -L "$link" ]] || fail "installer replaced a symlinked config with a regular file: $link"
@@ -449,6 +506,17 @@ capture_log="$(find "$HOME/.local/state/beam-debug" -name latest.log | head -1)"
 [[ "$(stat -c %a "$(dirname -- "$capture_log")")" == "700" ]] \
   || fail "state directory is not 0700: $(stat -c %a "$(dirname -- "$capture_log")")"
 
+# Reading legacy state re-tightens it: pre-hardening journals and capture
+# logs must not stay umask-readable just because only reads touch them.
+chmod 0644 -- "$journal_file"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) || fail 'history failed'
+[[ "$(stat -c %a "$journal_file")" == "600" ]] \
+  || fail "journal was not re-tightened by history: $(stat -c %a "$journal_file")"
+chmod 0644 -- "$capture_log"
+(cd "$repo" && "$HOME/.local/bin/beam-debug" latest >/dev/null) || fail 'latest failed'
+[[ "$(stat -c %a "$capture_log")" == "600" ]] \
+  || fail "capture log was not re-tightened by latest: $(stat -c %a "$capture_log")"
+
 printf 'Checking per-project manifest and version floor...\n'
 if python3 -c 'import tomllib' >/dev/null 2>&1; then
   (
@@ -524,6 +592,12 @@ BADCASES
   printf 'enabled = true\nminimum_version = "1.0.0"\n' > "$repo/.beam-debug.toml"
   (cd "$repo" && "$HOME/.local/bin/beam-debug" history >/dev/null) \
     || fail 'a satisfied floor must not block commands'
+  # Refreshing the notes advances the floor with them: otherwise an older
+  # version would still be permitted to overwrite the refreshed notes later.
+  (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null) \
+    || fail 'init-project refresh failed on a satisfied floor'
+  grep -q "minimum_version = \"$(cat "$ROOT/VERSION")\"" "$repo/.beam-debug.toml" \
+    || fail 'init-project refresh did not advance the floor to the installed version'
 else
   printf 'note: python3 lacks tomllib (needs 3.11+); checking fail-closed behavior only.\n'
   (cd "$repo" && "$HOME/.local/bin/beam-debug" init-project >/dev/null) \

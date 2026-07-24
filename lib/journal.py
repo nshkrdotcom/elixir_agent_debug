@@ -22,6 +22,23 @@ def journal_path(state_dir):
     return Path(state_dir) / "journal.jsonl"
 
 
+def tighten(path):
+    # type: (Path) -> None
+    # Any access re-tightens legacy state: journals written before the
+    # permission hardening may still carry umask modes.
+    if not path.exists():
+        return
+    for directory in (path.parent, path.parent.parent):
+        try:
+            os.chmod(str(directory), 0o700)
+        except OSError:
+            pass
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
 def read_entries(path):
     # type: (Path) -> list
     if not path.exists():
@@ -83,6 +100,7 @@ def format_entry(entry):
 def command_history(args):
     # type: (argparse.Namespace) -> int
     path = journal_path(args.state_dir)
+    tighten(path)
     entries = read_entries(path)
     if not entries:
         print("beam-debug: no journal entries for this repository: {}".format(path))
@@ -97,6 +115,7 @@ def command_history(args):
 def command_report(args):
     # type: (argparse.Namespace) -> int
     path = journal_path(args.state_dir)
+    tighten(path)
     entries = read_entries(path)
     if not entries:
         print("beam-debug: no journal entries for this repository: {}".format(path))

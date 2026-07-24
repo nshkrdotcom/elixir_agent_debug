@@ -171,6 +171,9 @@ BeamDebug.stop_calls()
 other observations use `:sys.get_state/2`, `:sys.get_status/2` and
 `Process.info/2`. Note that `:sys.*` only works on OTP behaviours. An existing
 tracer is never replaced silently — pass `replace: true` to take tracing over.
+Do not start another raw `:erlang.trace` or `:dbg` call trace while a
+BeamDebug trace is active: legacy tracing has no tracer-scoped disable, so
+BeamDebug's shutdown clears legacy call-trace flags globally.
 
 ## Inline instrumentation: a real fallback, not the default
 

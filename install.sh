@@ -61,15 +61,31 @@ install_package() {
     return
   fi
 
-  local temp
-  temp="$(mktemp -d)"
-  mkdir -p -- "$temp/package"
-  if ! cp -a -- "$SOURCE_ROOT/." "$temp/package/"; then
-    rm -rf -- "$temp"
+  if [[ ! -f "$SOURCE_ROOT/MANIFEST.sha256" ]]; then
+    printf 'install.sh: MANIFEST.sha256 not found in %s; refusing a blind copy.\n' "$SOURCE_ROOT" >&2
     return 1
   fi
-  rm -rf -- "$temp/package/.git" "$temp/package/__pycache__" \
-    "$temp/package/hooks/__pycache__" "$temp/package/lib/__pycache__"
+
+  # Install exactly the manifest's file list: a source checkout can also
+  # contain _build, .env files, editor artifacts and other local files that
+  # must not be copied into (or persisted by) the installed package.
+  local temp file _hash
+  temp="$(mktemp -d)"
+  mkdir -p -- "$temp/package"
+  while read -r _hash file; do
+    [[ -n "$file" ]] || continue
+    if [[ ! -f "$SOURCE_ROOT/$file" ]]; then
+      printf 'install.sh: manifest entry missing from source: %s\n' "$file" >&2
+      rm -rf -- "$temp"
+      return 1
+    fi
+    mkdir -p -- "$temp/package/$(dirname -- "$file")"
+    if ! cp -a -- "$SOURCE_ROOT/$file" "$temp/package/$file"; then
+      rm -rf -- "$temp"
+      return 1
+    fi
+  done < "$SOURCE_ROOT/MANIFEST.sha256"
+  cp -a -- "$SOURCE_ROOT/MANIFEST.sha256" "$temp/package/MANIFEST.sha256"
   mkdir -p -- "$(dirname -- "$TARGET")"
   rm -rf -- "$TARGET"
   mv -- "$temp/package" "$TARGET"

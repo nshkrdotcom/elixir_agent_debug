@@ -335,6 +335,15 @@ defmodule BeamDebug do
   state. Isolated trace sessions created via the `:trace` module cannot be
   detected.
 
+  One legacy tracer at a time, for the *whole* session: do not start another
+  raw `:erlang.trace` or `:dbg` call trace while a BeamDebug session is
+  active. Pre-existing tracers are detected and refused, but the legacy API
+  has no tracer-scoped disable, so BeamDebug's shutdown clears legacy
+  call-trace flags globally — a foreign call trace that managed to start
+  mid-session (mostly prevented anyway by the VM's one-tracer-per-process
+  rule) can be disabled by it. The `:dbg` *server* itself is never stopped
+  by ordinary shutdown; this constraint is about trace flags.
+
       BeamDebug.trace_calls({MyApp.Worker, :handle_call, 3}, limit: 50)
       BeamDebug.trace_calls(MyApp.Worker)
   """

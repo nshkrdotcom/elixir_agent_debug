@@ -450,9 +450,12 @@ if scenario helper-foreign-pid-tracer; then
 fi
 
 if scenario helper-dbg-survives-shutdown; then
-  # 5 (v1.2.2 review): a :dbg session started while BeamDebug tracing is
+  # 5 (v1.2.2 review): a :dbg *server* started while BeamDebug tracing is
   # active must not be silently stopped by ordinary BeamDebug shutdown; only
-  # an explicit replace takeover may stop :dbg.
+  # an explicit replace takeover may stop :dbg. This covers the server
+  # process only: active foreign call-trace *flags* started mid-session are
+  # explicitly unsupported (legacy tracing has no tracer-scoped disable) —
+  # see the trace_calls/2 documentation.
   run helper-dbg-survives-shutdown "$WORK" -- elixir -r "$ROOT/support/beam_debug.exs" -e '
     {:ok, _} = BeamDebug.trace_calls({:lists, :seq, 2}, limit: 5)
     {:ok, _} = :dbg.tracer()

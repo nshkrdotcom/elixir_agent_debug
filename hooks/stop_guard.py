@@ -56,12 +56,13 @@ SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSIO
 MAX_UNTRACKED_BYTES = 1 << 20
 
 
-def _git_binary():
-    # type: () -> str
+def recorded_git():
+    # type: () -> Optional[str]
     # The install records trusted absolute binary paths in
     # lib/runtime-paths.conf. Resolving `git` through PATH instead would let
     # a project environment (direnv, venv activation, a prepended repo
-    # directory) substitute its own executable under the Stop hook.
+    # directory) substitute its own executable. Returns None when the record
+    # is missing, malformed, or points at a binary that no longer exists.
     conf = Path(__file__).resolve().parent.parent / "lib" / "runtime-paths.conf"
     try:
         for line in conf.read_text(encoding="utf-8").splitlines():
@@ -69,12 +70,16 @@ def _git_binary():
                 candidate = line[len("git="):].strip()
                 if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                     return candidate
+                return None
     except OSError:
-        pass
-    return "git"
+        return None
+    return None
 
 
-GIT = _git_binary()
+# Explicitly invoked commands (scan, assert-clean, begin, end) may fall back
+# to PATH so a development checkout stays usable; automatic hook mode must
+# not — it fails open instead (see hook_mode).
+GIT = recorded_git() or "git"
 
 
 class Finding(NamedTuple):
@@ -335,7 +340,18 @@ def load_entries(root):
     entries = []  # type: List[Tuple[Path, Dict[str, object]]]
     if not directory.is_dir():
         return entries
+    # Any access re-tightens legacy state: ledgers written before the
+    # permission hardening may still carry umask modes.
+    for level in (directory, directory.parent, directory.parent.parent):
+        try:
+            os.chmod(str(level), 0o700)
+        except OSError:
+            pass
     for path in sorted(directory.glob("*.json")):
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -505,6 +521,12 @@ def hook_mode():
     # completion is worse than a forgotten marker, and `beam-debug
     # assert-clean` remains the manual fallback.
     try:
+        if recorded_git() is None:
+            # The hook chain must never resolve binaries through PATH. With
+            # no valid recorded git there is no trusted way to inspect the
+            # repository: fail open rather than fall back.
+            return 0
+
         event = read_event()
         session_id = event.get("session_id")
         if not isinstance(session_id, str) or not session_id:
