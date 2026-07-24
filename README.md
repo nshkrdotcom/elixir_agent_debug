@@ -108,7 +108,11 @@ Install for only one client:
 
 The installer is idempotent and only owns files or marked sections created by
 this package. It refuses to overwrite an unrelated skill or executable with
-the same name. Selection is **additive**: installing for one client does not
+the same name. Managed edits respect how you keep your dotfiles: a symlinked
+`CLAUDE.md`, `AGENTS.md`, `settings.json` or `hooks.json` is updated through
+the link, never replaced by a regular file, and an existing file's mode is
+preserved (a private `0600` settings file stays `0600`; JSON configuration
+the installer creates from scratch is `0600` too). Selection is **additive**: installing for one client does not
 remove the other client's integration, and reinstalling without `--hooks`
 does not remove an existing hook — removal is always explicit, via
 `--remove-hooks` or `./uninstall.sh`.

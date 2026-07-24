@@ -285,6 +285,15 @@ export ELIXIR_AGENT_DEBUG_HOME="$HOME/.local/share/elixir-agent-debug"
 mkdir -p "$HOME/.claude" "$HOME/.codex"
 printf '# Existing Claude preference\n' > "$HOME/.claude/CLAUDE.md"
 printf '# Existing Codex preference\n' > "$HOME/.codex/AGENTS.md"
+
+# Dotfile-managed setups symlink these files into a repository. The managed
+# edits must write through the links — never replace them with regular
+# files — and must preserve a private file mode.
+mkdir -p "$HOME/dotfiles"
+mv "$HOME/.claude/CLAUDE.md" "$HOME/dotfiles/claude-md"
+ln -s ../dotfiles/claude-md "$HOME/.claude/CLAUDE.md"
+mv "$HOME/.codex/AGENTS.md" "$HOME/dotfiles/agents-md"
+ln -s ../dotfiles/agents-md "$HOME/.codex/AGENTS.md"
 # Each config carries an unrelated hook that must survive, plus every legacy
 # package hook-command form — plain python3 (pre-1.4.3) and PATH-resolved
 # python3 -I -S (1.4.3) — which the upgrade must migrate to one absolute
@@ -322,8 +331,23 @@ cat > "$HOME/.codex/hooks.json" <<JSON
 }
 JSON
 
+# settings.json is also symlinked, and private: mode must survive the edit.
+mv "$HOME/.claude/settings.json" "$HOME/dotfiles/claude-settings.json"
+ln -s ../dotfiles/claude-settings.json "$HOME/.claude/settings.json"
+chmod 0600 "$HOME/dotfiles/claude-settings.json"
+
 "$ROOT/install.sh" --hooks
 "$ROOT/install.sh" --hooks
+
+for link in "$HOME/.claude/CLAUDE.md" "$HOME/.claude/settings.json" "$HOME/.codex/AGENTS.md"; do
+  [[ -L "$link" ]] || fail "installer replaced a symlinked config with a regular file: $link"
+done
+[[ "$(stat -c %a "$HOME/dotfiles/claude-settings.json")" == "600" ]] \
+  || fail "installer broadened a 0600 settings file: $(stat -c %a "$HOME/dotfiles/claude-settings.json")"
+grep -q 'elixir-agent-debug:begin' "$HOME/dotfiles/claude-md" \
+  || fail 'managed block was not written through the CLAUDE.md symlink'
+grep -q 'stop_guard.py' "$HOME/dotfiles/claude-settings.json" \
+  || fail 'hook was not written through the settings.json symlink'
 
 [[ -x "$HOME/.local/bin/beam-debug" ]] || fail 'beam-debug not installed'
 [[ -f "$HOME/.claude/skills/elixir-debug/SKILL.md" ]] || fail 'Claude skill missing'
@@ -524,5 +548,20 @@ grep -q 'existing-claude' "$HOME/.claude/settings.json" || fail 'existing Claude
 grep -q 'existing-codex' "$HOME/.codex/hooks.json" || fail 'existing Codex hook was removed'
 ! grep -q 'stop_guard.py' "$HOME/.claude/settings.json" || fail 'package Claude hook remained'
 ! grep -q 'stop_guard.py' "$HOME/.codex/hooks.json" || fail 'package Codex hook remained'
+
+for link in "$HOME/.claude/CLAUDE.md" "$HOME/.claude/settings.json" "$HOME/.codex/AGENTS.md"; do
+  [[ -L "$link" ]] || fail "uninstall replaced a symlinked config with a regular file: $link"
+done
+[[ "$(stat -c %a "$HOME/dotfiles/claude-settings.json")" == "600" ]] \
+  || fail 'uninstall broadened the 0600 settings file'
+! grep -q 'elixir-agent-debug:begin' "$HOME/dotfiles/claude-md" \
+  || fail 'managed block was not removed through the CLAUDE.md symlink'
+
+printf 'Checking that newly created JSON configuration is private...\n'
+rm -f "$HOME/.codex/hooks.json"
+"$ROOT/install.sh" --codex-only --hooks >/dev/null
+[[ "$(stat -c %a "$HOME/.codex/hooks.json")" == "600" ]] \
+  || fail "newly created hooks.json is not 0600: $(stat -c %a "$HOME/.codex/hooks.json")"
+"$ELIXIR_AGENT_DEBUG_HOME/uninstall.sh" >/dev/null
 
 printf 'PASS\n'

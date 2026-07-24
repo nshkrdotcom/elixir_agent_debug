@@ -3,11 +3,14 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import shlex
+import stat
 import sys
+import tempfile
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
 BEGIN = "<!-- elixir-agent-debug:begin -->"
@@ -18,12 +21,35 @@ BLOCK_RE = re.compile(
 )
 
 
-def write_text_atomic(path, text):
-    # type: (Path, str) -> None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".elixir-agent-debug.tmp")
-    temp.write_text(text, encoding="utf-8")
-    temp.replace(path)
+def write_text_atomic(path, text, default_mode=0o644):
+    # type: (Path, str, int) -> None
+    # Write through symlinks, not over them: dotfile-managed configurations
+    # link these files into a repository, and replacing the link with a
+    # regular file would silently break that management. The temporary file
+    # is created securely in the resolved target's own directory (same
+    # filesystem, atomic replace) and carries the target's existing mode —
+    # a private 0600 settings file must not come back umask-readable — or
+    # default_mode when the file is new.
+    target = path.resolve() if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except OSError:
+        mode = default_mode
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".elixir-agent-debug.tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, str(target))
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def add_block(path, snippet_path):
@@ -64,7 +90,10 @@ def write_json(path, data):
     if path.exists():
         backup = path.with_name(path.name + ".elixir-agent-debug.bak")
         shutil.copy2(str(path), str(backup))
-    write_text_atomic(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
+    # Hook configuration can reference private setup; new files are 0600.
+    write_text_atomic(
+        path, json.dumps(data, indent=2, sort_keys=False) + "\n", default_mode=0o600
+    )
 
 
 def iter_hook_commands(entry):
